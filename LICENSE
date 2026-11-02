@@ -1,0 +1,106 @@
+szNote License v1.0
+===================
+
+Copyright (c) 2026 szNote authors (https://github.com/zsgm-bit/szNote)
+
+本许可采用「双轨授权」：非商业用途宽松免费，商业用途需付费授权。
+
+This is a dual-license: free and permissive for non-commercial use;
+commercial use requires a paid license.
+
+
+一、非商业使用（免费，宽松许可）
+--------------------------------
+
+在符合下列条件的前提下，任何人可以免费、无限制地使用本软件及其源代码，包括：
+使用、复制、修改、合并、发布、分发、再许可，以及创作衍生作品。
+
+"非商业目的"指不以营利为目的的使用，包括但不限于：
+个人学习、研究、兴趣爱好项目；
+教学、学术研究与非营利组织的内部使用；
+对软件本身的功能评估、测试与演示（无论评估方是否为商业实体）。
+
+二、商业使用（需付费授权）
+--------------------------
+
+任何以营利为目的的使用，均须事先取得著作权人的书面商业授权，包括但不限于：
+
+1. 在营利性组织内部部署使用，用于支撑其经营业务；
+2. 以 SaaS、托管服务、云市场等形式向第三方提供本软件或其衍生服务，无论是否直接收费；
+3. 将本软件或其主要部分集成进商业产品、硬件设备、解决方案并对外销售；
+4. 商业性改编、二次开发、定制开发，或将衍生作品用于上述任一场景；
+5. 以本软件为基础提供收费的技术支持、培训、咨询或运维服务。
+
+商业授权按年订阅或一次性买断，具体范围、价格与条款请联系作者商谈：
+  GitHub Issues: https://github.com/zsgm-bit/szNote/issues
+  邮件: 见仓库 README「商业授权」一节
+
+未取得商业授权而进行商业使用的，视为违反本许可。
+
+三、共同条件（适用于全部使用场景）
+----------------------------------
+
+1. 保留本许可文件、版权声明，以及源代码中已有的许可与版权提示；
+2. 修改后的版本须显著标注已修改，且不得暗示原作者为其背书；
+3. 不得移除或规避软件中的版权、许可标识；
+4. 本许可不授予商标使用权，szNote 名称与标识归作者所有。
+
+四、免责声明
+------------
+
+本软件按"现状"提供，不附带任何明示或默示的担保，包括但不限于对适销性、
+特定用途适用性和非侵权性的担保。在任何情况下，作者或著作权人均不对因本软件
+或本软件的使用或其他交易而产生的任何索赔、损害或其他责任承担责任。
+
+五、许可终止
+------------
+
+违反本许可任何条款的，本许可自动终止；在停止违约行为并取得作者书面确认前，
+不得继续使用本软件。
+
+
+English Version (authoritative for international use)
+-----------------------------------------------------
+
+1. Non-Commercial Use (Free, Permissive)
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the conditions below, provided such use is for non-commercial
+purposes only.
+
+"Non-commercial" means use that is not primarily intended for or directed
+toward commercial advantage or monetary compensation, including personal,
+educational, research, and non-profit internal use, as well as evaluation of
+the Software regardless of the evaluator's nature.
+
+2. Commercial Use (Paid License Required)
+Any commercial use requires a prior written commercial license from the
+copyright holder, including without limitation: internal deployment by a
+for-profit organization in support of its business; providing the Software or a
+derivative as a hosted/SaaS offering to third parties, with or without direct
+fees; embedding the Software in a commercial product, appliance, or solution
+offered for sale; commercial modification, customization, or creation of
+derivative works; and paid support, training, consulting, or managed services
+based on the Software.
+
+3. Conditions
+The above copyright notice and this license shall be included in all copies or
+substantial portions of the Software. Modified versions must be plainly marked
+as modified. No trademark rights are granted.
+
+4. Disclaimer
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+5. Termination
+Any breach of this license terminates the rights granted herein.
+
+SPDX-License-Identifier: LicenseRef-szNote-1.0

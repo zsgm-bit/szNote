@@ -1,0 +1,10 @@
+data/
+test-data/
+dist/
+sznote
+sznote.exe
+quicknote
+quicknote.exe
+*.exe
+*.log
+.DS_Store

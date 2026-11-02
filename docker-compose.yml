@@ -1,0 +1,18 @@
+services:
+  sznote:
+    build: .
+    image: sznote:local
+    container_name: sznote
+    restart: unless-stopped
+    ports:
+      - "9720:9720"           # 宿主机端口:容器端口
+    environment:
+      - TZ=Asia/Shanghai
+      - SZN_PORT=9720         # 容器内服务端口（一般不用改）
+      - SZN_TTL_HOURS=24      # 默认有效期（24=1天/72=3天/120=5天/168=7天），页面可按笔记改
+      - SZN_MAX_NOTE_KB=1024  # 单条笔记正文上限 (KB)
+      - SZN_MAX_FILE_MB=50    # 单个上传文件上限 (MB)
+      - SZN_RATE_KBPS=100     # 每连接下载限速 (KB/s)，0 = 不限速
+      - SZN_PASSWORD=         # 站点访问密码（阅读/编辑同一密码）。留空 = 不启用。公网部署务必设置！
+    volumes:
+      - ./data:/app/data      # 笔记与附件持久化到宿主机 ./data 目录
