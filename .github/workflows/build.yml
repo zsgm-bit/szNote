@@ -175,11 +175,13 @@ jobs:
       - name: 打包
         run: |
           set -euo pipefail
+          # 分发物必须随附许可文本（AGPL-3.0 合规要求），源码对应版本见本 tag
+          cp LICENSE COMMERCIAL-LICENSE.md dist/
           cd dist
           for f in sznote_*; do
             case "$f" in
-              *.exe) zip "${f%.exe}.zip" "$f" ;;
-              *)     tar -czf "$f.tar.gz" "$f" ;;
+              *.exe) zip "${f%.exe}.zip" "$f" LICENSE COMMERCIAL-LICENSE.md ;;
+              *)     tar -czf "$f.tar.gz" "$f" LICENSE COMMERCIAL-LICENSE.md ;;
             esac
           done
           sha256sum *.tar.gz *.zip > checksums.txt
@@ -200,4 +202,5 @@ jobs:
             - Docker: `docker run -d -p 9720:9720 -v $PWD/data:/app/data ghcr.io/${{ github.repository }}:${{ github.ref_name }}`
             - 校验: `sha256sum -c checksums.txt`
 
-            授权：非商业使用免费（见 LICENSE），商业使用需付费授权。
+            授权：AGPL-3.0 + 商业许可双轨制。遵守 AGPL-3.0（含 §13 源码开放义务）可免费使用；
+            需要闭源部署 / SaaS 不公开源码 / OEM 白标，请购买商业许可（见 COMMERCIAL-LICENSE.md）。

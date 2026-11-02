@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Copyright (c) 2026 szNote authors <https://github.com/zsgm-bit/szNote>
+// 双轨授权：AGPL-3.0（见 LICENSE）或商业许可（见 COMMERCIAL-LICENSE.md）。
+
 package main
 
 // szNote —— 类 note.ms 的自托管网页笔记服务（前后端一体，单二进制）

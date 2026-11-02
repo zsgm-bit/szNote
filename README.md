@@ -1,13 +1,14 @@
 # szNote
 
 [![build](https://github.com/zsgm-bit/szNote/actions/workflows/build.yml/badge.svg)](https://github.com/zsgm-bit/szNote/actions/workflows/build.yml)
-[![license](https://img.shields.io/badge/license-szNote%201.0%20(non--commercial%20free)-blue.svg)](LICENSE)
+[![license](https://img.shields.io/badge/license-AGPL--3.0%20%7C%20Commercial-blue.svg)](LICENSE)
 
 类 [note.ms](https://note.ms) 的自托管网页笔记服务：Go 前后端一体、单二进制、零第三方依赖。
 打开 `http://your-host:9720/任意地址` 就能写 Markdown、贴图、传文件，到期自动删除。
 
-> 授权提示：**非商业使用完全免费**（个人 / 教学 / 研究 / 非营利）；
-> **商业使用与商业改编需付费授权**，详见 [授权](#授权)。
+> 授权提示：本项目采用 **AGPL-3.0 + 商业许可 双轨制**。
+> 遵守 AGPL-3.0（含 §13 网络服务源码开放义务）即可**免费商用**；
+> 需要闭源部署／SaaS 不公开源码／OEM 白标，请购买商业许可，详见 [授权](#授权)。
 
 ## 特性
 
@@ -187,20 +188,32 @@ docker run -d --name sznote -p 9720:9720 \
 
 ## 授权
 
-本项目采用 **szNote License v1.0**（双轨授权，全文见 [LICENSE](LICENSE)）：
+本项目采用 **AGPL-3.0 + 商业许可 双轨制（dual licensing）**：
 
-| 场景 | 是否需要付费 |
+- 开源许可：[GNU AGPL-3.0](LICENSE) —— 遵守其义务即可免费使用，**包含商业使用**
+- 商业许可：[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md) —— 无法履行 AGPL 义务时的付费替代方案
+
+| 场景 | 授权方式 |
 |---|---|
-| 个人学习、兴趣项目、自用 | 免费 |
-| 教学、学术研究、非营利组织内部使用 | 免费 |
-| 商业实体的功能评估与演示 | 免费 |
-| **营利组织内部部署，支撑经营业务** | **需商业授权** |
-| **以 SaaS / 托管 / 云市场形式对外提供** | **需商业授权** |
-| **集成进商业产品、硬件、方案对外销售** | **需商业授权** |
-| **商业性改编、二次开发、定制开发** | **需商业授权** |
-| **基于本项目的收费支持 / 培训 / 运维** | **需商业授权** |
+| 个人学习、自用、兴趣项目 | AGPL-3.0，免费 |
+| 教学、学术研究、非营利组织内部使用 | AGPL-3.0，免费 |
+| 公司内部评估、POC、演示 | AGPL-3.0，免费 |
+| 商业使用，且愿意公开修改后的源码 | AGPL-3.0，免费 |
+| **闭源内部部署并修改源码** | **需商业许可** |
+| **对外提供网页服务（含 SaaS）但不公开修改后的源码** | **需商业许可** |
+| **集成进商业产品、硬件、方案对外销售** | **需商业许可** |
+| **OEM / 白标发布** | **需商业许可** |
+| **基于本项目的收费支持 / 培训 / 运维** | **需商业许可** |
 
-商业授权（年度订阅或一次性买断）请通过仓库 [Issues](https://github.com/zsgm-bit/szNote/issues) 联系作者说明用途与规模，获取报价与合同。
+> **AGPL-3.0 §13（网络服务条款）是关键**：只要用户通过网络与修改后的版本交互，就必须向这些用户提供
+> 获取完整对应源码的方式——包括你自己的修改。**不打算公开修改内容，就需要商业许可。**
+
+商业许可形式：年度订阅、一次性买断、OEM/白标（按产品线议价）。请通过
+[Issues](https://github.com/zsgm-bit/szNote/issues)（标题注明 `[商业授权]`）说明使用主体、部署方式、
+是否修改源码与规模，获取报价与合同。
+
+> 版本说明：`v1.0.0` 及更早的发布物沿用旧的 szNote License v1.0；**自 `v1.0.1` 起改为 AGPL-3.0 + 商业许可双轨制**，
+> 已发布的旧版本授权不受影响。
 
 第三方组件许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
 

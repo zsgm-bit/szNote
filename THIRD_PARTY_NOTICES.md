@@ -1,6 +1,7 @@
 # 第三方组件声明 / Third-Party Notices
 
-szNote 本体（Go 后端、前端逻辑、样式）为原创代码，采用 szNote License v1.0。
+szNote 本体（Go 后端、前端逻辑、样式）为原创代码，采用 GNU AGPL-3.0（另有商业许可，见
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md)）。
 前端内嵌了以下第三方库（随二进制一起分发，未做修改）：
 
 | 组件 | 版本 | 许可 | 用途 | 主页 |
