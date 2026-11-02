@@ -167,6 +167,8 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -180,7 +182,8 @@ jobs:
           cd dist
           for f in sznote_*; do
             case "$f" in
-              *.exe) zip "${f%.exe}.zip" "$f" LICENSE COMMERCIAL-LICENSE.md ;;
+              *.tar.gz|*.zip) continue ;;   # 已打包产物，跳过（保证重复执行幂等）
+              *.exe) zip -q "${f%.exe}.zip" "$f" LICENSE COMMERCIAL-LICENSE.md ;;
               *)     tar -czf "$f.tar.gz" "$f" LICENSE COMMERCIAL-LICENSE.md ;;
             esac
           done
