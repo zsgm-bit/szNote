@@ -40,34 +40,187 @@ const (
 	slugLen  = 6
 
 	sessionCookie = "qn_session"
-	sessionDays   = 7 // 登录会话有效期（天）
 
 	maxTTLHours = 168 // 笔记最长有效期：7 天（0 = 永久，单独判断）
 )
 
+// fileConfig 对应 config.json 的结构。字段留空/省略时使用内置默认值。
+type fileConfig struct {
+	Server struct {
+		Port        flexInt `json:"port"` // 允许 9720 或 "9720" 两种写法
+		Password    string  `json:"password"`
+		SessionDays int     `json:"session_days"`
+	} `json:"server"`
+	Storage struct {
+		DataDir         string `json:"data_dir"`
+		MaxNoteMB       int    `json:"max_note_mb"`
+		MaxFileMB       int    `json:"max_file_mb"`
+		InlinePreviewKB int    `json:"inline_preview_kb"`
+	} `json:"storage"`
+	Policy struct {
+		DefaultTTLHours int `json:"default_ttl_hours"`
+		RateKBPS        int `json:"rate_kbps"`
+	} `json:"policy"`
+	Security struct {
+		MaxLoginAttempts int `json:"max_login_attempts"`
+		LockMinutes      int `json:"lock_minutes"`
+	} `json:"security"`
+}
+
 var (
-	port    = envOr("SZN_PORT", "9720")
-	dataDir = envOr("SZN_DATA", "./data")
-	ttl     = time.Duration(envInt("SZN_TTL_HOURS", 24)) * time.Hour
-	maxNote = int64(envInt("SZN_MAX_NOTE_KB", 1024)) << 10 // 笔记正文上限，默认 1MB
-	maxFile = int64(envInt("SZN_MAX_FILE_MB", 50)) << 20   // 单文件上限，默认 50MB
+	port    = "9720"
+	dataDir = "./data"
+	ttl     = 24 * time.Hour
+	maxNote = int64(5) << 20  // 笔记正文上限，默认 5MB
+	maxFile = int64(50) << 20 // 单文件上限，默认 50MB
+	// 文本类附件在线预览的大小上限（KB），超过则改为下载
+	inlinePreviewKB = 512
 	// 每连接下载限速（KB/s），0 = 不限速
-	rateKBPS = envInt("SZN_RATE_KBPS", 0)
+	rateKBPS = 100
 
 	slugRe   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 	reserved = map[string]bool{"static": true, "api": true, "f": true, "favicon.ico": true}
 
 	writeMu sync.Mutex // 序列化所有写操作，避免并发写坏文件
 
-	// 站点密码（环境变量 SZN_PASSWORD，留空则不启用鉴权）
-	sitePassword = envOr("SZN_PASSWORD", "")
-	authSecret   []byte // 启动时随机生成，用于签名会话 Cookie
+	sitePassword = "" // 站点密码，留空则不启用鉴权
+	authSecret   []byte
+	sessionDays  = 7 // 登录会话有效期（天）
 
-	// 登录防爆破：同一 IP 连续失败 5 次锁定 10 分钟
+	maxLoginAttempts = 5  // 连续失败多少次锁 IP
+	lockMinutes      = 10 // 锁定时长（分钟）
+
+	configPath = "config.json" // 实际加载的配置文件路径（日志用）
+
 	failMu    sync.Mutex
 	failCount = map[string]int{}
 	failUntil = map[string]time.Time{}
 )
+
+// flexInt 兼容 "9720" 与 9720 两种写法，避免手写 JSON 时类型不匹配导致整份配置失效
+type flexInt int
+
+func (f *flexInt) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if s == "" || s == "null" {
+		return nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return fmt.Errorf("需要整数，收到 %s", s)
+	}
+	*f = flexInt(n)
+	return nil
+}
+
+// defaultConfig 内置默认值（config.json 缺失或缺字段时使用）
+func defaultConfig() fileConfig {
+	cfg := fileConfig{}
+	cfg.Server.Port = 9720
+	cfg.Server.SessionDays = 7
+	cfg.Storage.DataDir = "./data"
+	cfg.Storage.MaxNoteMB = 5
+	cfg.Storage.MaxFileMB = 50
+	cfg.Storage.InlinePreviewKB = 512
+	cfg.Policy.DefaultTTLHours = 24
+	cfg.Policy.RateKBPS = 100
+	cfg.Security.MaxLoginAttempts = 5
+	cfg.Security.LockMinutes = 10
+	return cfg
+}
+
+// loadConfig 按「内置默认值 → config.json → 环境变量」的优先级装配配置。
+// 环境变量优先级最高，便于在容器/CI 里临时覆盖单个参数。
+func loadConfig() {
+	def := defaultConfig()
+	cfg := def
+
+	// 配置文件位置：SZN_CONFIG（或旧名 QN_CONFIG），默认工作目录下 config.json
+	path := envOr("SZN_CONFIG", "config.json")
+	configPath = path
+	if b, err := os.ReadFile(path); err == nil {
+		tmp := def // 先填默认值再解 JSON，缺字段就保留默认
+		if err := json.Unmarshal(b, &tmp); err != nil {
+			log.Printf("配置: %s 解析失败，全部改用内置默认值（%v）", path, err)
+		} else {
+			cfg = tmp
+			log.Printf("配置: 已加载 %s", path)
+		}
+	} else if !os.IsNotExist(err) {
+		log.Printf("配置: 读取 %s 失败，改用内置默认值（%v）", path, err)
+	}
+
+	// 应用到运行时变量
+	port = strconv.Itoa(int(cfg.Server.Port))
+	sitePassword = cfg.Server.Password
+	sessionDays = cfg.Server.SessionDays
+	dataDir = cfg.Storage.DataDir
+	maxNote = int64(cfg.Storage.MaxNoteMB) << 20
+	maxFile = int64(cfg.Storage.MaxFileMB) << 20
+	inlinePreviewKB = cfg.Storage.InlinePreviewKB
+	ttl = time.Duration(cfg.Policy.DefaultTTLHours) * time.Hour
+	rateKBPS = cfg.Policy.RateKBPS
+	maxLoginAttempts = cfg.Security.MaxLoginAttempts
+	lockMinutes = cfg.Security.LockMinutes
+
+	// 环境变量覆盖（旧版 QN_ 前缀同样兼容）
+	if v := envOr("SZN_PORT", ""); v != "" {
+		port = v
+	}
+	if v := envOr("SZN_PASSWORD", ""); v != "" {
+		sitePassword = v
+	}
+	if v := envOr("SZN_DATA", ""); v != "" {
+		dataDir = v
+	}
+	if n, ok := envIntSet("SZN_SESSION_DAYS"); ok {
+		sessionDays = n
+	}
+	if n, ok := envIntSet("SZN_MAX_NOTE_MB"); ok {
+		maxNote = int64(n) << 20
+	} else if n, ok := envIntSet("SZN_MAX_NOTE_KB"); ok { // 旧变量
+		maxNote = int64(n) << 10
+	}
+	if n, ok := envIntSet("SZN_MAX_FILE_MB"); ok {
+		maxFile = int64(n) << 20
+	}
+	if n, ok := envIntSet("SZN_INLINE_PREVIEW_KB"); ok {
+		inlinePreviewKB = n
+	}
+	if n, ok := envIntSet("SZN_TTL_HOURS"); ok {
+		ttl = time.Duration(n) * time.Hour
+	}
+	if n, ok := envIntSet("SZN_RATE_KBPS"); ok {
+		rateKBPS = n
+	}
+	if n, ok := envIntSet("SZN_MAX_LOGIN_ATTEMPTS"); ok {
+		maxLoginAttempts = n
+	}
+	if n, ok := envIntSet("SZN_LOCK_MINUTES"); ok {
+		lockMinutes = n
+	}
+
+	// 兜底：避免 0 值把服务搞成不可用
+	if !validTTL(int(ttl.Hours())) {
+		log.Printf("配置: default_ttl_hours=%d 不在 24/72/120/168 之内，改用 24", int(ttl.Hours()))
+		ttl = 24 * time.Hour
+	}
+	if maxNote <= 0 {
+		maxNote = 5 << 20
+	}
+	if maxFile <= 0 {
+		maxFile = 50 << 20
+	}
+	if sessionDays <= 0 {
+		sessionDays = 7
+	}
+	if maxLoginAttempts <= 0 {
+		maxLoginAttempts = 5
+	}
+	if lockMinutes <= 0 {
+		lockMinutes = 10
+	}
+}
 
 // ---------- 工具函数 ----------
 
@@ -84,13 +237,13 @@ func envOr(key, def string) string {
 	return def
 }
 
-func envInt(key string, def int) int {
+func envIntSet(key string) (int, bool) {
 	if v := envOr(key, ""); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil && n >= 0 {
-			return n
+			return n, true
 		}
 	}
-	return def
+	return 0, false
 }
 
 func notesRoot() string { return filepath.Join(dataDir, notesSub) }
@@ -104,8 +257,10 @@ func validSlug(slug string) bool {
 }
 
 // noteMeta 每条笔记的元数据。TTLHours: 24/72/120/168（即 1/3/5/7 天）；文件不存在 = 使用全局默认
+// Plain: true 表示纯文本模式（前端不解析 Markdown，适合贴日志/命令）
 type noteMeta struct {
-	TTLHours int `json:"ttl_hours"`
+	TTLHours int  `json:"ttl_hours"`
+	Plain    bool `json:"plain,omitempty"`
 }
 
 func loadMeta(slug string) (noteMeta, bool) {
@@ -118,6 +273,12 @@ func loadMeta(slug string) (noteMeta, bool) {
 		return m, false
 	}
 	return m, true
+}
+
+// plainFor 该笔记是否处于纯文本模式（无 meta 视为 Markdown）
+func plainFor(slug string) bool {
+	m, ok := loadMeta(slug)
+	return ok && m.Plain
 }
 
 // validTTL 允许的有效期：仅 1/3/5/7 天
@@ -209,24 +370,34 @@ func getNote(w http.ResponseWriter, r *http.Request) {
 		"content":   content,
 		"files":     listFiles(slug),
 		"ttl_hours": ttlHours,
+		"plain":     plainFor(slug),
 	})
 }
 
-// PUT /api/{slug} —— 保存笔记正文 {"content": "...", "ttl_hours": 24}
-// ttl_hours: >0 小时数；0 = 永不过期；缺省 = 不修改（新笔记用全局默认）
+// PUT /api/{slug} —— 保存笔记正文 {"content": "...", "ttl_hours": 24, "plain": false}
+// ttl_hours: 只能是 24/72/120/168；缺省 = 不修改（新笔记用全局默认）
+// plain: 缺省 = 不修改
 func saveNote(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	if !validSlug(slug) {
 		fail(w, http.StatusNotFound, "无效的笔记地址")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxNote+4096)
+	// JSON 转义会放大体积，请求体上限给正文上限的 2 倍 + 64KB 余量，
+	// 真正的正文上限在解码后按字符数严格校验
+	r.Body = http.MaxBytesReader(w, r.Body, maxNote*2+(1<<16))
 	var body struct {
 		Content  string `json:"content"`
 		TTLHours *int   `json:"ttl_hours"`
+		Plain    *bool  `json:"plain"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		fail(w, http.StatusBadRequest, "请求体无效或超过大小限制")
+		fail(w, http.StatusRequestEntityTooLarge, "请求体无效或超过大小限制")
+		return
+	}
+	if int64(len(body.Content)) > maxNote {
+		fail(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("正文超过上限（%d MB）", maxNote>>20))
 		return
 	}
 	if body.TTLHours != nil {
@@ -252,8 +423,18 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusInternalServerError, "写入失败")
 		return
 	}
-	if body.TTLHours != nil {
-		if mb, err := json.Marshal(noteMeta{TTLHours: *body.TTLHours}); err == nil {
+	if body.TTLHours != nil || body.Plain != nil {
+		m, _ := loadMeta(slug) // 合并写入，避免覆盖另一项设置
+		if body.TTLHours != nil {
+			m.TTLHours = *body.TTLHours
+		}
+		if body.Plain != nil {
+			m.Plain = *body.Plain
+		}
+		if m.TTLHours == 0 { // 还没设过有效期：落成全局默认，避免 0 被当成无效值
+			m.TTLHours = int(ttl.Hours())
+		}
+		if mb, err := json.Marshal(m); err == nil {
 			_ = os.WriteFile(metaPath(slug), mb, 0o644)
 		}
 	}
@@ -415,6 +596,17 @@ func maybeThrottle(r io.ReadSeeker) io.ReadSeeker {
 	return &rateReader{r: r, rate: float64(rateKBPS) * 1024, last: time.Now()}
 }
 
+// textExts 可在线预览的纯文本类扩展名（日志、配置、脚本等，服务端零解析，直接按文本流出）
+var textExts = map[string]bool{
+	".log": true, ".txt": true, ".text": true, ".out": true, ".err": true,
+	".md": true, ".markdown": true, ".csv": true, ".tsv": true,
+	".json": true, ".xml": true, ".yml": true, ".yaml": true, ".toml": true,
+	".ini": true, ".conf": true, ".cfg": true, ".properties": true, ".env": true,
+	".sh": true, ".bash": true, ".zsh": true, ".ps1": true, ".bat": true, ".cmd": true,
+	".py": true, ".go": true, ".js": true, ".ts": true, ".java": true,
+	".c": true, ".h": true, ".cpp": true, ".rs": true, ".sql": true, ".service": true,
+}
+
 // GET /f/{slug}/{name} —— 提供附件下载/内嵌展示
 func serveFile(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
@@ -435,16 +627,20 @@ func serveFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "sandbox")
 
-	ctype := mime.TypeByExtension(strings.ToLower(filepath.Ext(name)))
+	ext := strings.ToLower(filepath.Ext(name))
+	ctype := mime.TypeByExtension(ext)
 	disposition := "attachment"
 	switch {
+	case textExts[ext]:
+		// 文本类：统一按 UTF-8 纯文本内嵌（浏览器零解析，服务端也只是流式转发）
+		ctype = "text/plain; charset=utf-8"
+		if inlinePreviewKB > 0 && info.Size() <= int64(inlinePreviewKB)<<10 {
+			disposition = "inline"
+		}
 	case strings.HasPrefix(ctype, "image/"),
 		strings.HasPrefix(ctype, "audio/"),
 		strings.HasPrefix(ctype, "video/"),
-		ctype == "application/pdf",
-		ctype == "text/plain",
-		ctype == "text/markdown",
-		ctype == "text/csv":
+		ctype == "application/pdf":
 		disposition = "inline"
 	}
 	if ctype != "" {
@@ -515,8 +711,8 @@ func recordLoginFail(ip string) {
 	failMu.Lock()
 	defer failMu.Unlock()
 	failCount[ip]++
-	if failCount[ip] >= 5 {
-		failUntil[ip] = time.Now().Add(10 * time.Minute)
+	if failCount[ip] >= maxLoginAttempts {
+		failUntil[ip] = time.Now().Add(time.Duration(lockMinutes) * time.Minute)
 		delete(failCount, ip)
 	}
 }
@@ -544,7 +740,8 @@ func login(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := clientIP(r)
 	if loginLocked(ip) {
-		fail(w, http.StatusTooManyRequests, "尝试次数过多，请 10 分钟后再试")
+		fail(w, http.StatusTooManyRequests,
+			fmt.Sprintf("尝试次数过多，请 %d 分钟后再试", lockMinutes))
 		return
 	}
 	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(sitePassword)) != 1 {
@@ -554,7 +751,7 @@ func login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clearLoginFails(ip)
-	expiry := time.Now().Add(sessionDays * 24 * time.Hour).Unix()
+	expiry := time.Now().Add(time.Duration(sessionDays) * 24 * time.Hour).Unix()
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
 		Value:    signSession(expiry),
@@ -650,8 +847,10 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 // GET /api/health —— 健康检查（始终开放，auth 告诉前端是否需要登录）
 func health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":   true,
-		"auth": sitePassword != "",
+		"ok":          true,
+		"auth":        sitePassword != "",
+		"max_note_mb": maxNote >> 20,
+		"max_file_mb": maxFile >> 20,
 	})
 }
 
@@ -697,6 +896,8 @@ func cleanOnce() {
 // ---------- 入口 ----------
 
 func main() {
+	loadConfig()
+
 	if err := os.MkdirAll(notesRoot(), 0o755); err != nil {
 		log.Fatalf("无法创建数据目录 %s: %v", notesRoot(), err)
 	}
@@ -724,7 +925,14 @@ func main() {
 
 	go janitor()
 
-	log.Printf("szNote 已启动: http://0.0.0.0:%s  数据目录=%s  默认过期时间=%v", port, dataDir, ttl)
+	log.Printf("szNote 已启动: http://0.0.0.0:%s  配置=%s", port, configPath)
+	log.Printf("  数据目录=%s  默认有效期=%v  正文上限=%dMB  单文件上限=%dMB",
+		dataDir, ttl, maxNote>>20, maxFile>>20)
+	if rateKBPS > 0 {
+		log.Printf("  附件下载限速=%d KB/s（0 = 不限速）  文本预览上限=%dKB", rateKBPS, inlinePreviewKB)
+	} else {
+		log.Printf("  附件下载限速=关闭  文本预览上限=%dKB", inlinePreviewKB)
+	}
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatal(err)
 	}

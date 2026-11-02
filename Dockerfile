@@ -10,8 +10,8 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=build /sznote /app/sznote
-ENV SZN_PORT=9720 \
-    SZN_DATA=/app/data
+# 内置一份默认配置；实际部署用 volume 挂载覆盖（见 docker-compose.yml）
+COPY config.json /app/config.json
 VOLUME /app/data
 EXPOSE 9720
 ENTRYPOINT ["/app/sznote"]

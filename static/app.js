@@ -6,6 +6,8 @@ const $ = (id) => document.getElementById(id);
 
 let dirty = false;
 let previewMode = 0; // 0=仅编辑 1=分屏 2=全屏预览
+let plainMode = false; // 纯文本模式：不解析 Markdown
+let MAX_NOTE_MB = 5; // 由 /api/health 下发，仅用于报错提示
 let saveTimer = null;
 let renderTimer = null;
 
@@ -54,8 +56,19 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
 
 function render() {
   const src = $("content").value;
+  const preview = $("preview");
+  /* 纯文本模式：不走 Markdown，直接按原文显示（textContent 天然转义，无 XSS 风险） */
+  if (plainMode) {
+    const pre = document.createElement("pre");
+    pre.className = "plaintext";
+    pre.textContent = src || "（空笔记）";
+    if (!src) pre.classList.add("empty");
+    preview.innerHTML = "";
+    preview.appendChild(pre);
+    return;
+  }
   const html = marked.parse(src, { gfm: true, breaks: true });
-  $("preview").innerHTML = DOMPurify.sanitize(html);
+  preview.innerHTML = DOMPurify.sanitize(html);
   decorateCodeBlocks();
 }
 
@@ -107,6 +120,7 @@ async function boot() {
   let needsLogin = false;
   try {
     const h = await (await fetch("/api/health")).json();
+    if (h.max_note_mb) MAX_NOTE_MB = h.max_note_mb;
     if (h.auth) {
       // 站点密码已启用：探测会话是否有效（未登录时受保护 API 返回 401）
       const probe = await fetch("/api/" + (slug || "__ping"));
@@ -198,6 +212,9 @@ function setupEditor() {
   $("btnCopyLink").onclick = copyLink;
   $("btnSave").onclick = save;
   $("btnPreview").onclick = togglePreview;
+  $("btnPlain").onclick = () => setPlain(!plainMode, true);
+  $("btnPlainOff").onclick = () => setPlain(false, true);
+  $("btnCopyAll").onclick = () => copyText($("content").value);
   $("btnUpload").onclick = () => $("fileInput").click();
   $("btnExport").onclick = () => window.open("/api/" + encodeURIComponent(slug) + "/export", "_blank");
   $("btnLogout").onclick = async (e) => {
@@ -322,6 +339,7 @@ async function load() {
   try {
     const d = await r.json();
     if (d.exists) $("content").value = d.content;
+    setPlain(!!d.plain, false);
     renderFiles(d.files || []);
     setStatus(d.exists ? "已加载" : "新笔记，首次保存后生效");
     if (d.exists) render();
@@ -346,7 +364,7 @@ async function save() {
     const r = await fetch("/api/" + encodeURIComponent(slug), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: $("content").value, ttl_hours: ttl }),
+      body: JSON.stringify({ content: $("content").value, ttl_hours: ttl, plain: plainMode }),
     });
     if (r.status === 401) {
       setStatus("登录已过期");
@@ -355,13 +373,17 @@ async function save() {
       setupLogin();
       return;
     }
-    if (!r.ok) throw new Error("http " + r.status);
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      throw new Error(d.error || "http " + r.status);
+    }
     dirty = false;
     setStatus("已保存 " + new Date().toLocaleTimeString());
     refreshFiles();
-  } catch {
+  } catch (err) {
     setStatus("保存失败！");
-    toast("保存失败，请重试");
+    const msg = err.message || "未知错误";
+    toast("保存失败：" + msg + (/上限|大小/.test(msg) ? "" : "（单条笔记上限 " + MAX_NOTE_MB + " MB）"));
   }
 }
 
@@ -391,6 +413,24 @@ function setPreviewMode(mode) {
   if (mode > 0) render();
 }
 
+/* 纯文本模式：不解析 Markdown，日志/命令原样显示；该状态随笔记存进 meta.json */
+function setPlain(on, persist = true) {
+  plainMode = on;
+  const btn = $("btnPlain");
+  btn.textContent = on ? "纯文本" : "Markdown";
+  btn.classList.toggle("active", on);
+  btn.title = on
+    ? "当前：纯文本模式（不解析 Markdown）。点击切回 Markdown"
+    : "当前：Markdown 模式。点击切到纯文本模式（适合贴日志 / 命令 / 配置）";
+  $("plainHint").classList.toggle("hidden", !on);
+  $("preview").classList.toggle("plainmode", on);
+  $("content").placeholder = on
+    ? "纯文本模式：直接粘贴日志、命令或配置…（不解析 Markdown，原样保存）"
+    : "在这里输入 Markdown…\n\n支持直接 Ctrl+V 粘贴截图，或把文件拖进来。";
+  if (previewMode > 0) render();
+  if (persist) { dirty = true; save(); }
+}
+
 async function uploadFile(file, isImage, insert = true) {
   setStatus("上传中 " + file.name + "…");
   const fd = new FormData();
@@ -400,7 +440,10 @@ async function uploadFile(file, isImage, insert = true) {
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || "上传失败");
     if (insert) {
-      const md = (isImage ? "!" : "") + "[" + d.name + "](" + d.url + ")";
+      /* 纯文本模式不插入 Markdown 语法，只贴裸链接，避免污染日志/命令 */
+      const md = plainMode
+        ? d.url
+        : (isImage ? "!" : "") + "[" + d.name + "](" + d.url + ")";
       insertAtCursor(md + "\n");
       dirty = true;
       save();

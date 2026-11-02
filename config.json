@@ -1,0 +1,21 @@
+{
+  "server": {
+    "port": 9720,
+    "password": "",
+    "session_days": 7
+  },
+  "storage": {
+    "data_dir": "./data",
+    "max_note_mb": 5,
+    "max_file_mb": 50,
+    "inline_preview_kb": 512
+  },
+  "policy": {
+    "default_ttl_hours": 24,
+    "rate_kbps": 100
+  },
+  "security": {
+    "max_login_attempts": 5,
+    "lock_minutes": 10
+  }
+}
