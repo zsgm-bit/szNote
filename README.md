@@ -6,10 +6,6 @@
 类 [note.ms](https://note.ms) 的自托管网页笔记服务：Go 前后端一体、单二进制、零第三方依赖。
 打开 `http://your-host:9720/任意地址` 就能写 Markdown、贴图、传文件，到期自动删除。
 
-> 授权提示：本项目采用 **AGPL-3.0 + 商业许可 双轨制**。
-> 遵守 AGPL-3.0（含 §13 网络服务源码开放义务）即可**免费商用**；
-> 需要闭源部署／SaaS 不公开源码／OEM 白标，请购买商业许可，详见 [授权](#授权)。
-
 ## 特性
 
 - **短链 / 自定义地址**：`http://<host>:9720/39gj29` 或 `/自定义名`（字母数字、`-`、`_`，最长 64）
@@ -186,6 +182,18 @@ docker run -d --name sznote -p 9720:9720 \
   ghcr.io/zsgm-bit/sznote:latest
 ```
 
+## 故障排查
+
+- **端口占用**：改 `docker-compose.yml` 里 `ports` 的宿主机端口，如 `"8080:9720"`。
+- **改了 config.json 不生效**：需要重启进程（`docker compose restart`）；Docker 下确认挂载的是同一个文件。
+- **config.json 写错**：启动日志会打印「解析失败，全部改用内置默认值」，按提示修 JSON（常见是多了逗号）。
+- **贴日志后标题/斜体乱掉**：日志里的 `#`、`*`、`_` 被当成 Markdown 了 —— 顶栏点「Markdown」切到**纯文本模式**。
+- **提示正文超过上限**：调大 `storage.max_note_mb`，或把大日志当附件上传（附件上限 `storage.max_file_mb`，默认 50MB）。
+- **预览大日志很慢**：受 `policy.rate_kbps` 限速影响（默认 100KB/s），内网部署建议设 `0`；超过 `inline_preview_kb` 的文本改为下载。
+- **附件点了没反应**：exe、html 等非白名单类型强制下载，属预期安全行为。
+- **数据在哪**：`./data/notes/<地址>/note.md` 是正文，`files/` 是附件；清理以 `note.md` 修改时间为准。
+- **忘记密码**：改 `config.json` 的 `server.password` 后重启。
+
 ## 授权
 
 本项目采用 **AGPL-3.0 + 商业许可 双轨制（dual licensing）**：
@@ -216,15 +224,3 @@ docker run -d --name sznote -p 9720:9720 \
 > 已发布的旧版本授权不受影响。
 
 第三方组件许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
-
-## 故障排查
-
-- **端口占用**：改 `docker-compose.yml` 里 `ports` 的宿主机端口，如 `"8080:9720"`。
-- **改了 config.json 不生效**：需要重启进程（`docker compose restart`）；Docker 下确认挂载的是同一个文件。
-- **config.json 写错**：启动日志会打印「解析失败，全部改用内置默认值」，按提示修 JSON（常见是多了逗号）。
-- **贴日志后标题/斜体乱掉**：日志里的 `#`、`*`、`_` 被当成 Markdown 了 —— 顶栏点「Markdown」切到**纯文本模式**。
-- **提示正文超过上限**：调大 `storage.max_note_mb`，或把大日志当附件上传（附件上限 `storage.max_file_mb`，默认 50MB）。
-- **预览大日志很慢**：受 `policy.rate_kbps` 限速影响（默认 100KB/s），内网部署建议设 `0`；超过 `inline_preview_kb` 的文本改为下载。
-- **附件点了没反应**：exe、html 等非白名单类型强制下载，属预期安全行为。
-- **数据在哪**：`./data/notes/<地址>/note.md` 是正文，`files/` 是附件；清理以 `note.md` 修改时间为准。
-- **忘记密码**：改 `config.json` 的 `server.password` 后重启。
