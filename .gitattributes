@@ -1,0 +1,10 @@
+# 统一换行符，保证在 Linux 上构建/运行与 Windows 表现一致
+* text=auto eol=lf
+
+# 二进制
+*.exe binary
+*.png binary
+*.jpg binary
+*.zip binary
+*.gz binary
+*.ico binary
