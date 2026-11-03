@@ -38,6 +38,7 @@
 
 ```bash
 # 1. 先按需修改 config.json（密码 / 上限 / 限速 / 有效期）
+#    不确定各字段含义？对照 config.example.json（带逐项注释）
 # 2. 启动
 docker compose up -d --build
 ```
@@ -46,32 +47,52 @@ docker compose up -d --build
 
 ### 方式二：单二进制
 
-从 [Releases](https://github.com/zsgm-bit/szNote/releases) 下载对应平台文件，解压后直接运行：
+从 [Releases](https://github.com/zsgm-bit/szNote/releases) 下载对应平台文件（压缩包内已含
+`config.example.json`），解压后：
 
 ```bash
-# Linux / macOS
+# 1. 生成配置：模板复制成实际生效的 config.json
+cp config.example.json config.json
+
+# 2. 生成密码哈希（推荐；也可直接在 config.json 里填明文 server.password）
+./sznote -hash 'your-password'      # 输出 pbkdf2$... 整行填到 server.password_hash
+
+# 3. 启动（Linux / macOS）
 chmod +x sznote_linux_amd64 && ./sznote_linux_amd64
 
 # Windows
 sznote_windows_amd64.exe
 ```
 
-二进制会读取**当前工作目录下的 `config.json`**，把它放在同一个目录即可；也可以用 `SZN_CONFIG=/path/to/config.json` 指定。
+二进制读取**当前工作目录下的 `config.json`**，所以配置文件要和二进制放在同一目录；
+也可以用 `SZN_CONFIG=/path/to/config.json` 指定任意路径。
+
+> 只想在本机或完全可信的内网免密试跑：把 `config.json` 里 `security.allow_anonymous` 改成 `true`。
+> 否则未设密码时服务会**拒绝启动**（安全默认，防止默认开放实例被公网扫到）。
 
 ### 方式三：源码构建
 
 ```bash
 git clone https://github.com/zsgm-bit/szNote.git
 cd szNote
-make build          # 产出 ./sznote
-make run            # 构建并运行
+cp config.example.json config.json   # 首次运行需要一份有效配置
+make build                           # 产出 ./sznote
+make run                             # 构建并运行
 ```
 
 或不用 make：`CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o sznote .`
 
 ## 配置
 
-所有参数集中在项目根目录的 **`config.json`** 里，改完重启生效。
+仓库里有**两个配置文件**，含义不同：
+
+| 文件 | 作用 | 是否被程序读取 |
+|---|---|---|
+| `config.json` | 实际生效的配置 | ✅ 是 |
+| `config.example.json` | 配置模板：字段含义、可选值、推荐值都写在里面 | ❌ 否（仅作参照/复制源） |
+
+升级或重新部署时，先 `cp config.example.json config.json` 再改，避免漏掉新版本新增的字段。
+所有参数集中在 `config.json` 里，改完重启生效。
 Docker 部署时该文件以只读方式挂载进容器（`./config.json:/app/config.json`），**改配置不用重新构建镜像**。
 
 ```json
@@ -171,7 +192,8 @@ make clean
 ```
 .
 ├── main.go                 # 全部后端逻辑（标准库）
-├── config.json             # 全部运行参数
+├── config.json             # 实际生效的配置（程序读取）
+├── config.example.json     # 配置模板（带注释，不被读取）
 ├── static/                 # 前端（HTML/CSS/JS + 内嵌 marked、DOMPurify）
 ├── Dockerfile              # 两阶段构建，产物 ~15MB
 ├── docker-compose.yml
@@ -220,6 +242,10 @@ docker run -d --name sznote -p 9720:9720 \
 
 ## 故障排查
 
+- **找不到配置文件 / 不知道写哪些字段**：配置模板是 `config.example.json`（仓库根目录，Release 压缩包内也有），
+  复制成 `config.json` 再改：`cp config.example.json config.json`。程序只读 `config.json`，模板文件不会被加载。
+- **启动报「配置: 未找到 config.json，使用内置默认值」**：正常提示——说明当前目录没有配置文件，
+  正在用内置默认值；此时若没设密码会紧接着因安全检查拒绝启动，按上一条处理即可。
 - **启动报「拒绝启动：…无访问密码」**：设置 `server.password`（或 `password_hash`），或在可信内网把 `security.allow_anonymous` 设为 `true`。
 - **上传提示「不允许上传该类型文件」/「文件内容与类型不符」**：主动内容格式（html/svg 等）被禁止，属预期安全行为；需要分享网页代码请贴正文或打包成 zip。
 - **端口占用**：改 `docker-compose.yml` 里 `ports` 的宿主机端口，如 `"8080:9720"`。

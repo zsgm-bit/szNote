@@ -1,0 +1,35 @@
+{
+  "_说明": "szNote 配置模板。复制为 config.json 后修改（cp config.example.json config.json）。程序只读 config.json，本文件不会被加载。所有字段都可省略，省略即用内置默认值；下划线开头的键是注释，程序会忽略。",
+
+  "server": {
+    "_密码说明": "二选一：password 填明文（简单，但密码会明文落盘）；password_hash 填 ./sznote -hash '你的密码' 的输出（推荐，优先于明文）。两者都为空 = 不启用鉴权，此时必须把 security.allow_anonymous 设为 true 才能启动。",
+    "port": 9720,
+    "password": "",
+    "password_hash": "",
+    "session_days": 7
+  },
+
+  "storage": {
+    "_说明": "max_note_mb=单条笔记正文上限；max_file_mb=单个附件上限；inline_preview_kb=文本附件在线预览上限，超出改下载；max_note_total_mb=单笔记正文+附件总量上限，0=不限制。",
+    "data_dir": "./data",
+    "max_note_mb": 5,
+    "max_file_mb": 50,
+    "inline_preview_kb": 512,
+    "max_note_total_mb": 200
+  },
+
+  "policy": {
+    "_说明": "default_ttl_hours 只能填 24 / 72 / 120 / 168（1/3/5/7 天）。rate_kbps=每连接下载限速，0=不限速（内网建议 0）。",
+    "default_ttl_hours": 24,
+    "rate_kbps": 100
+  },
+
+  "security": {
+    "_说明": "allow_anonymous=false 且没设密码时服务会拒绝启动（安全默认）。trusted_proxies 只有命中这些 IP/CIDR 时才信任 X-Forwarded-For，反向代理部署请把反代地址加进来，否则登录锁定与限速拿到的是代理 IP。",
+    "max_login_attempts": 5,
+    "lock_minutes": 10,
+    "trusted_proxies": ["127.0.0.1", "::1"],
+    "rate_rps": 50,
+    "allow_anonymous": false
+  }
+}

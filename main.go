@@ -192,6 +192,8 @@ func loadConfig() {
 		}
 	} else if !os.IsNotExist(err) {
 		log.Printf("配置: 读取 %s 失败，改用内置默认值（%v）", path, err)
+	} else {
+		log.Printf("配置: 未找到 %s，使用内置默认值（可从 config.example.json 复制一份再改）", path)
 	}
 
 	// 应用到运行时变量
@@ -1292,7 +1294,9 @@ func main() {
 	if !authOn && !allowAnonymous {
 		log.Printf("安全检查未通过：未设置 server.password / server.password_hash / SZN_PASSWORD")
 		log.Fatal("拒绝启动：当前将监听所有网卡但无访问密码。请设置密码（推荐），" +
-			"或在 config.json 的 security.allow_anonymous 设为 true（仅限完全可信的内网）")
+			"或在 config.json 的 security.allow_anonymous 设为 true（仅限完全可信的内网）。\n" +
+			"没有配置文件？把同目录的 config.example.json 复制为 config.json，" +
+			"用 ./sznote -hash '你的密码' 生成哈希填到 server.password_hash。")
 	}
 
 	if err := os.MkdirAll(notesRoot(), 0o700); err != nil {

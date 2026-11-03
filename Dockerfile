@@ -18,6 +18,8 @@ COPY --from=build /sznote /app/sznote
 COPY LICENSE /app/
 # 内置一份默认配置；实际部署用 volume 挂载覆盖（见 docker-compose.yml）
 COPY config.json /app/config.json
+# 配置模板（字段说明齐全），改配置时可参照
+COPY config.example.json /app/config.example.json
 VOLUME /app/data
 EXPOSE 9720
 ENTRYPOINT ["/app/sznote"]

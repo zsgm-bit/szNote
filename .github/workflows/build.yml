@@ -177,14 +177,14 @@ jobs:
       - name: 打包
         run: |
           set -euo pipefail
-          # 分发物随附许可文本（MIT 要求保留版权与许可声明）
-          cp LICENSE dist/
+          # 分发物随附许可文本（MIT 要求保留版权与许可声明）与配置模板
+          cp LICENSE config.example.json dist/
           cd dist
           for f in sznote_*; do
             case "$f" in
               *.tar.gz|*.zip) continue ;;   # 已打包产物，跳过（保证重复执行幂等）
-              *.exe) zip -q "${f%.exe}.zip" "$f" LICENSE ;;
-              *)     tar -czf "$f.tar.gz" "$f" LICENSE ;;
+              *.exe) zip -q "${f%.exe}.zip" "$f" LICENSE config.example.json ;;
+              *)     tar -czf "$f.tar.gz" "$f" LICENSE config.example.json ;;
             esac
           done
           sha256sum *.tar.gz *.zip > checksums.txt
@@ -202,6 +202,8 @@ jobs:
             szNote ${{ github.ref_name }}
 
             - 单二进制，无运行时依赖；下载对应平台文件解压即用
+            - 首次运行：`cp config.example.json config.json`，用 `./sznote -hash '你的密码'` 生成哈希
+              填入 `server.password_hash`（仅内网免密试跑才把 `security.allow_anonymous` 设为 `true`）
             - Docker: `docker run -d -p 9720:9720 -v $PWD/data:/app/data ghcr.io/${{ github.repository }}:${{ github.ref_name }}`
             - 校验: `sha256sum -c checksums.txt`
 
