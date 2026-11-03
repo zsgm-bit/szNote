@@ -9,7 +9,7 @@
 ## 特性
 
 - **短链 / 自定义地址**：`http://<host>:9720/39gj29` 或 `/自定义名`（字母数字、`-`、`_`，最长 64）
-- **站点密码保护**：设置 `SZN_PASSWORD` 后，阅读 / 编辑 / 上传统一登录；会话为 HMAC 签名 Cookie（7 天有效），密码比较恒定时间，连续失败 5 次锁 IP 10 分钟
+- **站点密码保护**：设置密码后，阅读 / 编辑 / 上传统一登录；密码支持明文或 PBKDF2 哈希（`sznote -hash` 生成，推荐）；会话存服务端（退出登录 / 重启即吊销），Cookie 带 `HttpOnly + SameSite=Strict`，HTTPS 下自动加 `Secure`；连续失败 5 次锁 IP 10 分钟
 - **Markdown + 三态预览**：点「预览」＝分屏，再点＝全屏预览，再点回到编辑（`Ctrl+P` 同效）
 - **纯文本模式**：一键切到纯文本（每个笔记独立记忆），不解析 Markdown，日志里的 `#`、`*`、`_` 原样保留，附「复制全部」；排错贴日志 / 命令用这个
 - **图片粘贴 / 拖拽**：`Ctrl+V` 贴截图自动上传并插入引用；拖到编辑区插引用，拖到右侧附件栏只存不插
@@ -19,15 +19,18 @@
 - **有效期 1 / 3 / 5 / 7 天**：按笔记选择，以最后一次查看 / 保存 / 上传为记账起点，到期整文件夹删除（服务端白名单校验）
 - **整包导出 zip**：正文 + 全部附件一键打包
 - **附件管理**：缩略图、悬停看完整文件名、一键下载、同名文件自动加序号
-- **下载限速**：默认每连接 100 KB/s，兼容 Range 断点续传
+- **下载限速**：默认每连接 100 KB/s，兼容 Range 断点续传；另有每 IP 全局请求限速防扫描
+- **内容安全**：全站 CSP（禁外链脚本 / 禁被 iframe 嵌套 / 禁表单外发）、DOMPurify 渲染净化防同源钓鱼、禁止上传 html/svg 等主动内容格式并做内容嗅探、附件带 `CSP: sandbox` 强制隔离
 - **配置独立成文件**：全部参数集中在 `config.json`，改完重启即生效，不用改 compose
 - **零依赖**：纯 Go 标准库；前端 marked / DOMPurify 本地内嵌，构建不联网拉模块
 - **持久化**：数据落在 `./data`，容器重建不丢
 
 > 安全提示：知道地址（及密码）的人即可查看和编辑，请勿存放敏感信息。
-> 公网部署务必：① 设置 `config.json` 的 `server.password`；② 前置 Nginx / Caddy 做 HTTPS（服务本身不提供 TLS，密码走明文 HTTP 会被嗅探）。
-> 附件响应带 CSP sandbox，非白名单类型强制下载，不会在浏览器中执行脚本。
-> 如果配置文件里填了真实密码，请勿提交到公开仓库 —— 可改用 `SZN_PASSWORD` 环境变量注入。
+> **公网 / 穿透部署务必**：① `./sznote -hash 你的密码` 生成哈希填入 `server.password_hash`，
+> 并确认 `security.allow_anonymous` 为 `false`；② 前置 Nginx / Caddy 做 HTTPS
+> （服务本身不提供 TLS，且 Cookie 的 `Secure` 属性依赖反代传入 `X-Forwarded-Proto: https`）。
+> 不设密码时服务会拒绝启动，除非显式声明 `allow_anonymous: true`（仅限可信内网）。
+> 如果配置文件里填了真实密码，请勿提交到公开仓库 —— 推荐用 `password_hash`，或改用 `SZN_PASSWORD` 环境变量注入。
 
 ## 快速开始
 
@@ -110,14 +113,14 @@ Docker 部署时该文件以只读方式挂载进容器（`./config.json:/app/co
 # 输出形如 pbkdf2$210000$<salt>$<hash>，整行复制到 server.password_hash 即可
 ```
 
-环境变量仅用于临时覆盖（`SZN_` 前缀，旧版 `QN_` 前缀仍兼容）：
+环境变量仅用于临时覆盖（`SZN_` 前缀，旧版 `QN_` 前缀仍兼容；未列出的参数请改 `config.json`）：
 
 | 变量 | 对应配置项 |
 |---|---|
-| `SZN_PORT` / `SZN_PASSWORD` / `SZN_SESSION_DAYS` | `server.*` |
-| `SZN_DATA` / `SZN_MAX_NOTE_MB` / `SZN_MAX_FILE_MB` / `SZN_INLINE_PREVIEW_KB` | `storage.*` |
-| `SZN_TTL_HOURS` / `SZN_RATE_KBPS` | `policy.*` |
-| `SZN_MAX_LOGIN_ATTEMPTS` / `SZN_LOCK_MINUTES` / `SZN_ALLOW_ANONYMOUS` | `security.*` |
+| `SZN_CONFIG` | 配置文件路径（默认工作目录下 `config.json`） |
+| `SZN_PORT` | `server.port` |
+| `SZN_PASSWORD` | `server.password` |
+| `SZN_DATA` | `storage.data_dir` |
 
 ## 存储结构
 
@@ -186,14 +189,23 @@ make clean
 | push `main` | 交叉编译 6 个平台并上传 artifact；构建 `linux/amd64,linux/arm64` 镜像推送 `ghcr.io/zsgm-bit/sznote:latest` |
 | push tag `v*` | 额外把各平台二进制打包为 `.tar.gz` / `.zip` + `checksums.txt`，自动创建 GitHub Release |
 
-镜像使用示例：
+镜像使用示例（推荐把 `config.json` 一起挂载，密码用哈希）：
 
 ```bash
+# 1. 生成密码哈希
+docker run --rm ghcr.io/zsgm-bit/sznote:latest -hash 'your-password'
+# 2. 把输出填入 config.json 的 server.password_hash（allow_anonymous 保持 false）
+# 3. 启动
 docker run -d --name sznote -p 9720:9720 \
-  -e SZN_PASSWORD='your-password' \
+  -v "$PWD/config.json:/app/config.json:ro" \
   -v "$PWD/data:/app/data" \
   ghcr.io/zsgm-bit/sznote:latest
 ```
+
+快速体验也可以只用环境变量：`-e SZN_PASSWORD='your-password'`（优先级高于 config.json）。
+
+> 生产环境建议前置 Nginx / Caddy 做 HTTPS 并转发 `X-Forwarded-Proto: https`，
+> 同时把反代地址加入 `security.trusted_proxies`，这样登录锁定与全局限速才能拿到真实客户端 IP。
 
 ## 安全机制（v1.0.2 加固）
 
@@ -220,7 +232,7 @@ docker run -d --name sznote -p 9720:9720 \
 - **预览大日志很慢**：受 `policy.rate_kbps` 限速影响（默认 100KB/s），内网部署建议设 `0`；超过 `inline_preview_kb` 的文本改为下载。
 - **附件点了没反应**：exe、html 等非白名单类型强制下载，属预期安全行为。
 - **数据在哪**：`./data/notes/<地址>/note.md` 是正文，`files/` 是附件；清理以 `note.md` 修改时间为准。
-- **忘记密码**：改 `config.json` 的 `server.password` 后重启。
+- **忘记密码**：重新生成一个，`./sznote -hash 新密码`，把输出覆盖到 `config.json` 的 `server.password_hash` 后重启（此时会踢掉所有已登录会话）。
 
 ## 授权
 
