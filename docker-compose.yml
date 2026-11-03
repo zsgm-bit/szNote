@@ -15,3 +15,11 @@ services:
     volumes:
       - ./config.json:/app/config.json:ro   # 配置文件（只读挂载，改完 docker compose restart 生效）
       - ./data:/app/data                    # 笔记与附件持久化
+    # ---- 容器加固：只读根文件系统 + 丢弃权限 + 禁止提权 ----
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m                       # multipart 上传的临时文件目录
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true

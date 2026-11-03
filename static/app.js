@@ -1,7 +1,13 @@
 /* szNote 前端逻辑（无框架，原生 JS） */
 "use strict";
 
-const slug = location.pathname === "/" ? "" : decodeURIComponent(location.pathname.slice(1));
+/* slug 解析容错：畸形转义序列不再抛错白屏 */
+let slug = "";
+try {
+  slug = location.pathname === "/" ? "" : decodeURIComponent(location.pathname.slice(1));
+} catch {
+  slug = location.pathname.slice(1);
+}
 const $ = (id) => document.getElementById(id);
 
 let dirty = false;
@@ -54,6 +60,15 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
   }
 });
 
+/* 净化配置：默认白名单会放行 form/input/style 等标签，可被用于同源钓鱼与界面伪装，
+   这里显式禁掉主动内容标签与危险属性（服务端 CSP form-action 'none' 是第二道防线） */
+const PURIFY_CFG = {
+  FORBID_TAGS: ["form", "input", "button", "select", "textarea", "option", "optgroup",
+    "style", "link", "meta", "base", "frame", "frameset", "object", "embed"],
+  FORBID_ATTR: ["action", "formaction", "style", "srcset", "background", "poster"],
+  ALLOW_DATA_ATTR: false,
+};
+
 function render() {
   const src = $("content").value;
   const preview = $("preview");
@@ -68,7 +83,7 @@ function render() {
     return;
   }
   const html = marked.parse(src, { gfm: true, breaks: true });
-  preview.innerHTML = DOMPurify.sanitize(html);
+  preview.innerHTML = DOMPurify.sanitize(html, PURIFY_CFG);
   decorateCodeBlocks();
 }
 
@@ -180,12 +195,20 @@ function setupLogin() {
 /* ---------- 首页 ---------- */
 
 function randomSlug() {
-  const A = "abcdefghjkmnpqrstuvwxyz23456789";
-  const b = new Uint8Array(6);
-  crypto.getRandomValues(b);
-  let s = "";
-  for (const v of b) s += A[v % A.length];
-  return s;
+  const A = "abcdefghjkmnpqrstuvwxyz23456789"; // 31 字符表，10 位 ≈ 49.5 bit 熵
+  const out = [];
+  const need = 10;
+  while (out.length < need) {
+    const b = new Uint8Array(need * 2);
+    crypto.getRandomValues(b);
+    const max = 256 - (256 % A.length); // rejection sampling 消除取模偏置
+    for (const v of b) {
+      if (v >= max) continue;
+      out.push(A[v % A.length]);
+      if (out.length === need) break;
+    }
+  }
+  return out.join("");
 }
 
 function setupHome() {
@@ -277,7 +300,10 @@ function setupEditor() {
       const m = lines[idx].trim().match(IMG_LINE);
       if (m) hit = { alt: m[1], url: m[2] };
     }
-    if (hit) {
+    /* 只预览本站附件（/f/）与 data: 图片；笔记里的任意外链不加载，
+       防止第三方追踪与浏览器侧内网探测 */
+    const safeImg = hit && (hit.url.startsWith("/f/") || hit.url.startsWith("data:image/"));
+    if (hit && safeImg) {
       if (hoverImg.getAttribute("src") !== hit.url) {
         hoverImg.src = hit.url;
         hoverName.textContent = hit.alt || decodeURIComponent(hit.url.split("/").pop() || "");

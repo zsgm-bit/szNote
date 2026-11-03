@@ -73,29 +73,42 @@ Docker 部署时该文件以只读方式挂载进容器（`./config.json:/app/co
 
 ```json
 {
-  "server":   { "port": 9720, "password": "", "session_days": 7 },
-  "storage":  { "data_dir": "./data", "max_note_mb": 5, "max_file_mb": 50, "inline_preview_kb": 512 },
+  "server":   { "port": 9720, "password": "", "password_hash": "", "session_days": 7 },
+  "storage":  { "data_dir": "./data", "max_note_mb": 5, "max_file_mb": 50, "inline_preview_kb": 512, "max_note_total_mb": 200 },
   "policy":   { "default_ttl_hours": 24, "rate_kbps": 100 },
-  "security": { "max_login_attempts": 5, "lock_minutes": 10 }
+  "security": { "max_login_attempts": 5, "lock_minutes": 10, "trusted_proxies": ["127.0.0.1", "::1"], "rate_rps": 50, "allow_anonymous": false }
 }
 ```
 
 | 配置项 | 默认 | 说明 |
 |---|---|---|
 | `server.port` | `9720` | 监听端口（Docker 下对外端口请改 `docker-compose.yml` 的 `ports` 左侧） |
-| `server.password` | 空 | 站点访问密码，阅读 / 编辑 / 上传统一使用；留空 = 不启用 |
-| `server.session_days` | `7` | 登录会话有效天数 |
+| `server.password` | 空 | 站点访问密码（明文），阅读 / 编辑 / 上传统一使用 |
+| `server.password_hash` | 空 | 站点密码的 PBKDF2 哈希（推荐，见下方「密码哈希」），优先于明文 |
+| `server.session_days` | `7` | 登录会话有效天数（会话存服务端，退出即吊销） |
 | `storage.data_dir` | `./data` | 数据目录（容器内为 `/app/data`） |
 | `storage.max_note_mb` | `5` | 单条笔记正文上限 (MB) |
 | `storage.max_file_mb` | `50` | **单个附件大小上限 (MB)** |
 | `storage.inline_preview_kb` | `512` | 文本附件在线预览上限 (KB)，超过则改为下载 |
+| `storage.max_note_total_mb` | `200` | 单笔记（正文+附件）总大小上限 (MB)，`0` = 不限制 |
 | `policy.default_ttl_hours` | `24` | 新笔记默认有效期，只能填 24 / 72 / 120 / 168（1/3/5/7 天） |
 | `policy.rate_kbps` | `100` | 每连接下载限速 (KB/s)，`0` = 不限速（内网建议 0） |
 | `security.max_login_attempts` | `5` | 同一 IP 连续登录失败多少次锁定 |
 | `security.lock_minutes` | `10` | 锁定时长（分钟） |
+| `security.trusted_proxies` | `["127.0.0.1","::1"]` | 可信反向代理 IP/CIDR：命中才解析 `X-Forwarded-For`（取真实客户端 IP 计数限速） |
+| `security.rate_rps` | `50` | 每 IP 全局请求速率上限 (req/s)，防扫描与资源耗尽 |
+| `security.allow_anonymous` | `false` | **显式接受"无密码匿名访问"风险**；不设密码又不开启此项时服务拒绝启动 |
 
-优先级：**内置默认值 → `config.json` → 环境变量**。字段少写就用默认值；JSON 写错会打印日志并整份回退默认值，不会带着半份配置启动。
-配置文件路径可用 `SZN_CONFIG=/path/to/config.json` 指定。
+> **安全默认值**：不设置密码（`password` / `password_hash` 均为空）且未显式声明
+> `allow_anonymous: true` 时，服务**拒绝启动**。本仓库自带的 `config.json` 已为内网共用场景
+> 打开了 `allow_anonymous`，**公网 / 穿透部署务必设置密码并把它改回 `false`**。
+
+**密码哈希（推荐）**：用内置命令生成哈希后填入 `password_hash`，避免密码明文落盘：
+
+```bash
+./sznote -hash 你的密码
+# 输出形如 pbkdf2$210000$<salt>$<hash>，整行复制到 server.password_hash 即可
+```
 
 环境变量仅用于临时覆盖（`SZN_` 前缀，旧版 `QN_` 前缀仍兼容）：
 
@@ -104,7 +117,7 @@ Docker 部署时该文件以只读方式挂载进容器（`./config.json:/app/co
 | `SZN_PORT` / `SZN_PASSWORD` / `SZN_SESSION_DAYS` | `server.*` |
 | `SZN_DATA` / `SZN_MAX_NOTE_MB` / `SZN_MAX_FILE_MB` / `SZN_INLINE_PREVIEW_KB` | `storage.*` |
 | `SZN_TTL_HOURS` / `SZN_RATE_KBPS` | `policy.*` |
-| `SZN_MAX_LOGIN_ATTEMPTS` / `SZN_LOCK_MINUTES` | `security.*` |
+| `SZN_MAX_LOGIN_ATTEMPTS` / `SZN_LOCK_MINUTES` / `SZN_ALLOW_ANONYMOUS` | `security.*` |
 
 ## 存储结构
 
@@ -182,13 +195,28 @@ docker run -d --name sznote -p 9720:9720 \
   ghcr.io/zsgm-bit/sznote:latest
 ```
 
+## 安全机制（v1.0.2 加固）
+
+- **鉴权与会话**：站点密码支持明文或 PBKDF2 哈希（`sznote -hash` 生成）；会话令牌带随机 nonce 且存于服务端会话表——**退出登录 / 重启进程即吊销**，被盗 Cookie 无法在登出后继续使用；Cookie 带 `HttpOnly + SameSite=Strict`，检测到 HTTPS（直连或反代 `X-Forwarded-Proto`）自动加 `Secure`。
+- **启动安全检查**：监听所有网卡但未设密码时拒绝启动，除非显式 `allow_anonymous: true`（仅限可信内网）。
+- **限速**：每 IP 全局令牌桶（`rate_rps`，默认 50 req/s）+ 登录失败锁定（支持 `trusted_proxies` 反代取真实 IP）。
+- **上传策略**：禁止 `.html/.htm/.svg/.hta/.php` 等主动内容格式；内容嗅探拒绝伪装成 `.dat` 的网页/SVG；单笔记总大小配额（`max_note_total_mb`）；上传内存阈值固定 8MB。
+- **响应头**：全站 CSP（`default-src 'self'`、`frame-ancestors 'none'`、`form-action 'none'`）+ `X-Frame-Options: DENY` + `Referrer-Policy: no-referrer`（笔记地址不会被外泄给第三方）；API 与页面 `Cache-Control: no-store`。**副作用：笔记 Markdown 里的外链图片不再在预览中显示**（仅本站附件 `/f/...` 与 `data:` 图片可内嵌）。
+- **渲染净化**：DOMPurify 显式禁用 `form/input/style` 等标签与 `action/style` 属性，防止在笔记里构造同源钓鱼页。
+- **附件服务**：`CSP: sandbox` + `nosniff`；SVG 一律强制下载；HTTP Server 带 `ReadHeaderTimeout` 等超时防 Slowloris。
+- **容器加固**：compose 默认 `read_only + cap_drop ALL + no-new-privileges` + tmpfs `/tmp`。
+
 ## 故障排查
 
+- **启动报「拒绝启动：…无访问密码」**：设置 `server.password`（或 `password_hash`），或在可信内网把 `security.allow_anonymous` 设为 `true`。
+- **上传提示「不允许上传该类型文件」/「文件内容与类型不符」**：主动内容格式（html/svg 等）被禁止，属预期安全行为；需要分享网页代码请贴正文或打包成 zip。
 - **端口占用**：改 `docker-compose.yml` 里 `ports` 的宿主机端口，如 `"8080:9720"`。
 - **改了 config.json 不生效**：需要重启进程（`docker compose restart`）；Docker 下确认挂载的是同一个文件。
 - **config.json 写错**：启动日志会打印「解析失败，全部改用内置默认值」，按提示修 JSON（常见是多了逗号）。
 - **贴日志后标题/斜体乱掉**：日志里的 `#`、`*`、`_` 被当成 Markdown 了 —— 顶栏点「Markdown」切到**纯文本模式**。
 - **提示正文超过上限**：调大 `storage.max_note_mb`，或把大日志当附件上传（附件上限 `storage.max_file_mb`，默认 50MB）。
+- **提示附件总大小超过上限**：调大 `storage.max_note_total_mb`（默认 200MB），或删掉旧附件。
+- **预览里外链图片不显示**：CSP 只允许本站附件与 `data:` 图片内嵌，属预期；把图片下载后作为本站附件插入即可。
 - **预览大日志很慢**：受 `policy.rate_kbps` 限速影响（默认 100KB/s），内网部署建议设 `0`；超过 `inline_preview_kb` 的文本改为下载。
 - **附件点了没反应**：exe、html 等非白名单类型强制下载，属预期安全行为。
 - **数据在哪**：`./data/notes/<地址>/note.md` 是正文，`files/` 是附件；清理以 `note.md` 修改时间为准。

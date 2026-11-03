@@ -15,6 +15,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -23,7 +24,9 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -41,7 +44,7 @@ const (
 	metaFile = "meta.json"                        // 笔记元数据（自定义有效期）
 	filesDir = "files"                            // 每条笔记的附件目录名
 	alphabet = "abcdefghjkmnpqrstuvwxyz23456789"  // 随机短链字母表（去掉易混淆字符）
-	slugLen  = 6
+	slugLen  = 10                                 // 随机地址长度（31 字符表 ≈ 49.5 bit 熵）
 
 	sessionCookie = "qn_session"
 
@@ -51,23 +54,28 @@ const (
 // fileConfig 对应 config.json 的结构。字段留空/省略时使用内置默认值。
 type fileConfig struct {
 	Server struct {
-		Port        flexInt `json:"port"` // 允许 9720 或 "9720" 两种写法
-		Password    string  `json:"password"`
-		SessionDays int     `json:"session_days"`
+		Port         flexInt `json:"port"` // 允许 9720 或 "9720" 两种写法
+		Password     string  `json:"password"`
+		PasswordHash string  `json:"password_hash"` // pbkdf2$iter$salt$hash（sznote -hash 生成），优先于明文
+		SessionDays  int     `json:"session_days"`
 	} `json:"server"`
 	Storage struct {
 		DataDir         string `json:"data_dir"`
 		MaxNoteMB       int    `json:"max_note_mb"`
 		MaxFileMB       int    `json:"max_file_mb"`
 		InlinePreviewKB int    `json:"inline_preview_kb"`
+		MaxNoteTotalMB  int    `json:"max_note_total_mb"` // 单笔记（含附件）总大小上限，0=不限制
 	} `json:"storage"`
 	Policy struct {
 		DefaultTTLHours int `json:"default_ttl_hours"`
 		RateKBPS        int `json:"rate_kbps"`
 	} `json:"policy"`
 	Security struct {
-		MaxLoginAttempts int `json:"max_login_attempts"`
-		LockMinutes      int `json:"lock_minutes"`
+		MaxLoginAttempts int      `json:"max_login_attempts"`
+		LockMinutes      int      `json:"lock_minutes"`
+		TrustedProxies   []string `json:"trusted_proxies"`   // 可信反代 IP/CIDR，命中才解析 X-Forwarded-For
+		RateRPS          int      `json:"rate_rps"`          // 每 IP 全局请求速率上限（req/s），0=内置默认 50
+		AllowAnonymous   bool     `json:"allow_anonymous"`   // 显式接受"无密码匿名访问"风险
 	} `json:"security"`
 }
 
@@ -87,19 +95,47 @@ var (
 
 	writeMu sync.Mutex // 序列化所有写操作，避免并发写坏文件
 
-	sitePassword = "" // 站点密码，留空则不启用鉴权
+	sitePassword = "" // 站点密码（明文），与 password_hash 二选一
+	passwordHash = "" // 站点密码（PBKDF2 哈希），优先于明文
+	authOn       bool // 是否启用鉴权（password / password_hash 任一非空）
 	authSecret   []byte
 	sessionDays  = 7 // 登录会话有效期（天）
 
 	maxLoginAttempts = 5  // 连续失败多少次锁 IP
 	lockMinutes      = 10 // 锁定时长（分钟）
 
+	maxNoteTotal = int64(200) << 20 // 单笔记含附件总大小上限
+	rateRPS      = 50.0             // 每 IP 全局请求速率（req/s）
+
+	allowAnonymous = false // 显式接受无密码匿名访问
+
+	trustedNets []*net.IPNet // 可信反代网段，命中才信任 X-Forwarded-For
+
 	configPath = "config.json" // 实际加载的配置文件路径（日志用）
 
-	failMu    sync.Mutex
-	failCount = map[string]int{}
-	failUntil = map[string]time.Time{}
+	// 登录失败锁定状态（带时间戳，可被 janitor 老化清理）
+	failMu sync.Mutex
+	failIP = map[string]*failState{}
+
+	// 服务端会话表：nonce -> 过期时间（支持退出即吊销）
+	sessMu     sync.Mutex
+	sessions   = map[string]int64{}
+	limMu      sync.Mutex
+	limitBucks = map[string]*limiter{}
 )
+
+// failState 单个 IP 的登录失败状态
+type failState struct {
+	count int
+	until time.Time // 锁定截止时间
+	last  time.Time // 最近一次失败时间（老化清理用）
+}
+
+// limiter 每 IP 令牌桶
+type limiter struct {
+	tokens float64
+	last   time.Time
+}
 
 // flexInt 兼容 "9720" 与 9720 两种写法，避免手写 JSON 时类型不匹配导致整份配置失效
 type flexInt int
@@ -126,10 +162,14 @@ func defaultConfig() fileConfig {
 	cfg.Storage.MaxNoteMB = 5
 	cfg.Storage.MaxFileMB = 50
 	cfg.Storage.InlinePreviewKB = 512
+	cfg.Storage.MaxNoteTotalMB = 200
 	cfg.Policy.DefaultTTLHours = 24
 	cfg.Policy.RateKBPS = 100
 	cfg.Security.MaxLoginAttempts = 5
 	cfg.Security.LockMinutes = 10
+	cfg.Security.TrustedProxies = []string{"127.0.0.1", "::1"} // 默认只信任本机反代
+	cfg.Security.RateRPS = 50
+	cfg.Security.AllowAnonymous = false
 	return cfg
 }
 
@@ -157,15 +197,22 @@ func loadConfig() {
 	// 应用到运行时变量
 	port = strconv.Itoa(int(cfg.Server.Port))
 	sitePassword = cfg.Server.Password
+	passwordHash = strings.TrimSpace(cfg.Server.PasswordHash)
 	sessionDays = cfg.Server.SessionDays
 	dataDir = cfg.Storage.DataDir
 	maxNote = int64(cfg.Storage.MaxNoteMB) << 20
 	maxFile = int64(cfg.Storage.MaxFileMB) << 20
 	inlinePreviewKB = cfg.Storage.InlinePreviewKB
+	maxNoteTotal = int64(cfg.Storage.MaxNoteTotalMB) << 20
 	ttl = time.Duration(cfg.Policy.DefaultTTLHours) * time.Hour
 	rateKBPS = cfg.Policy.RateKBPS
 	maxLoginAttempts = cfg.Security.MaxLoginAttempts
 	lockMinutes = cfg.Security.LockMinutes
+	allowAnonymous = cfg.Security.AllowAnonymous
+	if cfg.Security.RateRPS > 0 {
+		rateRPS = float64(cfg.Security.RateRPS)
+	}
+	trustedNets = parseCIDRs(cfg.Security.TrustedProxies)
 
 	// 环境变量覆盖（旧版 QN_ 前缀同样兼容）
 	if v := envOr("SZN_PORT", ""); v != "" {
@@ -173,6 +220,9 @@ func loadConfig() {
 	}
 	if v := envOr("SZN_PASSWORD", ""); v != "" {
 		sitePassword = v
+	}
+	if n, ok := envIntSet("SZN_ALLOW_ANONYMOUS"); ok {
+		allowAnonymous = n != 0
 	}
 	if v := envOr("SZN_DATA", ""); v != "" {
 		dataDir = v
@@ -333,14 +383,26 @@ func touch(slug string) {
 	}
 }
 
-func randSlug() string {
-	b := make([]byte, slugLen)
-	_, _ = rand.Read(b)
-	out := make([]byte, slugLen)
-	for i, v := range b {
-		out[i] = alphabet[int(v)%len(alphabet)]
+// randSlug 生成随机短地址：rejection sampling 消除取模偏置（CWE-338/341）
+func randSlug() (string, error) {
+	out := make([]byte, 0, slugLen)
+	buf := make([]byte, slugLen*2)
+	max := byte(256 - 256%len(alphabet)) // 248，保证均匀
+	for len(out) < slugLen {
+		if _, err := rand.Read(buf); err != nil {
+			return "", err
+		}
+		for _, v := range buf {
+			if v >= max {
+				continue // 拒绝采样，避免前几个字符概率偏高
+			}
+			out = append(out, alphabet[int(v)%len(alphabet)])
+			if len(out) == slugLen {
+				break
+			}
+		}
 	}
-	return string(out)
+	return string(out), nil
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -414,12 +476,12 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	dir := noteDir(slug)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		fail(w, http.StatusInternalServerError, "无法创建笔记目录")
 		return
 	}
 	tmp := notePath(slug) + ".tmp"
-	if err := os.WriteFile(tmp, []byte(body.Content), 0o644); err != nil {
+	if err := os.WriteFile(tmp, []byte(body.Content), 0o600); err != nil {
 		fail(w, http.StatusInternalServerError, "写入失败")
 		return
 	}
@@ -439,10 +501,18 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 			m.TTLHours = int(ttl.Hours())
 		}
 		if mb, err := json.Marshal(m); err == nil {
-			_ = os.WriteFile(metaPath(slug), mb, 0o644)
+			_ = os.WriteFile(metaPath(slug), mb, 0o600)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// blockedExts 禁止上传的主动内容格式（会在浏览器中执行脚本 / 可托管钓鱼页）
+var blockedExts = map[string]bool{
+	".html": true, ".htm": true, ".xhtml": true, ".shtml": true, ".hta": true,
+	".svg": true, ".svgz": true,
+	".php": true, ".asp": true, ".aspx": true, ".jsp": true, ".cgi": true,
+	".url": true, ".lnk": true, ".scr": true,
 }
 
 // POST /api/{slug}/upload —— 上传文件（multipart 字段名 file），返回访问 URL
@@ -453,9 +523,13 @@ func upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxFile+(1<<20))
-	if err := r.ParseMultipartForm(maxFile); err != nil {
+	// 内存阈值固定 8MB，超出部分自动落临时文件，避免并发上传放大内存（CWE-400）
+	if err := r.ParseMultipartForm(8 << 20); err != nil {
 		fail(w, http.StatusBadRequest, "文件过大或表单无效")
 		return
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll() // 清理临时文件
 	}
 	f, hdr, err := r.FormFile("file")
 	if err != nil {
@@ -465,14 +539,56 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 
 	name := safeName(hdr.Filename)
+	ext := strings.ToLower(filepath.Ext(name))
+	if blockedExts[ext] {
+		fail(w, http.StatusUnsupportedMediaType, "不允许上传该类型文件（网页/脚本类格式被禁止）")
+		return
+	}
+	// 内容嗅探：非文本扩展名但内容是 HTML/SVG，拒绝（防止改扩展名绕过）
+	if !textExts[ext] {
+		head := make([]byte, 512)
+		n, _ := io.ReadFull(f, head)
+		if n > 0 {
+			ct := http.DetectContentType(head[:n])
+			low := strings.ToLower(string(head[:n]))
+			if strings.HasPrefix(ct, "text/html") || ct == "image/svg+xml" ||
+				strings.Contains(low, "<svg") { // Go 嗅探器不认 <svg，手动补
+				fail(w, http.StatusUnsupportedMediaType, "文件内容与类型不符（检测到网页/脚本内容）")
+				return
+			}
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			fail(w, http.StatusInternalServerError, "读取文件失败")
+			return
+		}
+	}
 	dir := filepath.Join(noteDir(slug), filesDir)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		fail(w, http.StatusInternalServerError, "无法创建文件目录")
 		return
 	}
 
 	writeMu.Lock()
 	defer writeMu.Unlock()
+
+	// 单笔记总大小配额（防存储耗尽，CWE-400）
+	if maxNoteTotal > 0 {
+		var total int64
+		if entries, err := os.ReadDir(dir); err == nil {
+			for _, e := range entries {
+				if !e.IsDir() {
+					if info, err := e.Info(); err == nil {
+						total += info.Size()
+					}
+				}
+			}
+		}
+		if total+hdr.Size > maxNoteTotal {
+			fail(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("附件总大小超过上限（%d MB）", maxNoteTotal>>20))
+			return
+		}
+	}
 
 	// 同名文件自动追加序号：a.png -> a-1.png -> a-2.png
 	final := name
@@ -483,7 +599,7 @@ func upload(w http.ResponseWriter, r *http.Request) {
 		ext := filepath.Ext(name)
 		final = fmt.Sprintf("%s-%d%s", strings.TrimSuffix(name, ext), i, ext)
 	}
-	dst, err := os.Create(filepath.Join(dir, final))
+	dst, err := os.OpenFile(filepath.Join(dir, final), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "保存文件失败")
 		return
@@ -611,6 +727,21 @@ var textExts = map[string]bool{
 	".c": true, ".h": true, ".cpp": true, ".rs": true, ".sql": true, ".service": true,
 }
 
+// dispositionHeader 生成符合 RFC 6266/5987 的 Content-Disposition：
+// ASCII 回退名 + UTF-8 百分号编码名，避免中文/引号文件名解析异常
+func dispositionHeader(disp, name string) string {
+	var ascii strings.Builder
+	for _, r := range name {
+		if r >= 32 && r < 127 && r != '"' && r != '\\' {
+			ascii.WriteRune(r)
+		} else {
+			ascii.WriteByte('_')
+		}
+	}
+	return fmt.Sprintf(`%s; filename="%s"; filename*=UTF-8''%s`,
+		disp, ascii.String(), url.PathEscape(name))
+}
+
 // GET /f/{slug}/{name} —— 提供附件下载/内嵌展示
 func serveFile(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
@@ -641,7 +772,8 @@ func serveFile(w http.ResponseWriter, r *http.Request) {
 		if inlinePreviewKB > 0 && info.Size() <= int64(inlinePreviewKB)<<10 {
 			disposition = "inline"
 		}
-	case strings.HasPrefix(ctype, "image/"),
+	// SVG 可携带脚本/外部资源，一律强制下载；其余图片、音视频、PDF 可内嵌
+	case strings.HasPrefix(ctype, "image/") && ext != ".svg" && ext != ".svgz",
 		strings.HasPrefix(ctype, "audio/"),
 		strings.HasPrefix(ctype, "video/"),
 		ctype == "application/pdf":
@@ -650,7 +782,7 @@ func serveFile(w http.ResponseWriter, r *http.Request) {
 	if ctype != "" {
 		w.Header().Set("Content-Type", ctype)
 	}
-	w.Header().Set("Content-Disposition", fmt.Sprintf("%s; filename*=UTF-8''%q", disposition, name))
+	w.Header().Set("Content-Disposition", dispositionHeader(disposition, name))
 
 	f, err := os.Open(p)
 	if err != nil {
@@ -663,19 +795,135 @@ func serveFile(w http.ResponseWriter, r *http.Request) {
 
 // ---------- 站点密码鉴权 ----------
 
+// parseCIDRs 解析可信代理列表（支持裸 IP 与 CIDR）
+func parseCIDRs(list []string) []*net.IPNet {
+	var nets []*net.IPNet
+	for _, s := range list {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			continue
+		}
+		if ip := net.ParseIP(s); ip != nil {
+			if ip.To4() != nil {
+				nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(32, 32)})
+			} else {
+				nets = append(nets, &net.IPNet{IP: ip, Mask: net.CIDRMask(128, 128)})
+			}
+			continue
+		}
+		if _, n, err := net.ParseCIDR(s); err == nil {
+			nets = append(nets, n)
+		} else {
+			log.Printf("配置: trusted_proxies 中无法解析 %q，已忽略", s)
+		}
+	}
+	return nets
+}
+
+func ipTrusted(ip net.IP) bool {
+	for _, n := range trustedNets {
+		if n.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// clientIP 取客户端 IP：仅当直连来源是可信反代时才解析 X-Forwarded-For，
+// 且取**最后一个**值（反代追加语义下才是真实客户端，靠前的值可被客户端伪造）
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr
+		host = r.RemoteAddr
+	}
+	if ip := net.ParseIP(host); ip != nil && ipTrusted(ip) {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			for i := len(parts) - 1; i >= 0; i-- { // 从右往左找第一个非可信 IP
+				cand := strings.TrimSpace(parts[i])
+				if c := net.ParseIP(cand); c != nil && ipTrusted(c) {
+					continue
+				}
+				if cand != "" {
+					return cand
+				}
+			}
+		}
 	}
 	return host
 }
 
-// signSession 生成 "<过期时间hex>.<hmac>" 形式的会话令牌
-func signSession(expiry int64) string {
+const pbkdf2Iterations = 210000 // OWASP 推荐量级（PBKDF2-SHA256）
+
+// pbkdf2Key 标准库实现的 PBKDF2-HMAC-SHA256（避免引入第三方依赖）
+func pbkdf2Key(password, salt []byte, iter, keyLen int) []byte {
+	prf := func(data []byte) []byte {
+		mac := hmac.New(sha256.New, password)
+		mac.Write(data)
+		return mac.Sum(nil)
+	}
+	var out []byte
+	for block := 1; len(out) < keyLen; block++ {
+		u := prf(append(append([]byte{}, salt...),
+			byte(block>>24), byte(block>>16), byte(block>>8), byte(block)))
+		t := make([]byte, len(u))
+		copy(t, u)
+		for i := 1; i < iter; i++ {
+			u = prf(u)
+			for j := range t {
+				t[j] ^= u[j]
+			}
+		}
+		out = append(out, t...)
+	}
+	return out[:keyLen]
+}
+
+// verifyHash 校验 "pbkdf2$iter$salt_hex$hash_hex" 格式的密码哈希
+func verifyHash(password, stored string) bool {
+	parts := strings.Split(stored, "$")
+	if len(parts) != 4 || parts[0] != "pbkdf2" {
+		return false
+	}
+	iter, err := strconv.Atoi(parts[1])
+	if err != nil || iter < 1000 || iter > 10_000_000 {
+		return false
+	}
+	salt, err1 := hex.DecodeString(parts[2])
+	want, err2 := hex.DecodeString(parts[3])
+	if err1 != nil || err2 != nil || len(salt) < 8 || len(want) < 16 {
+		return false
+	}
+	got := sha256.Sum256(pbkdf2Key([]byte(password), salt, iter, len(want)))
+	w := sha256.Sum256(want) // 先哈希成定长再比较，消除长度侧信道
+	return subtle.ConstantTimeCompare(got[:], w[:]) == 1
+}
+
+// checkPassword 校验登录密码（优先 password_hash；明文先哈希再恒定比较）
+func checkPassword(input string) bool {
+	if passwordHash != "" {
+		return verifyHash(input, passwordHash)
+	}
+	a := sha256.Sum256([]byte(input))
+	b := sha256.Sum256([]byte(sitePassword))
+	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
+}
+
+// newSessionToken 生成 "nonce.exp.mac" 会话令牌，并登记进服务端会话表
+func newSessionToken(d time.Duration) (string, error) {
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	nonce := hex.EncodeToString(b)
+	exp := time.Now().Add(d).Unix()
 	mac := hmac.New(sha256.New, authSecret)
-	fmt.Fprintf(mac, "%d", expiry)
-	return fmt.Sprintf("%x.%x", expiry, mac.Sum(nil))
+	fmt.Fprintf(mac, "%s|%d", nonce, exp)
+	token := fmt.Sprintf("%s.%x.%x", nonce, exp, mac.Sum(nil))
+	sessMu.Lock()
+	sessions[nonce] = exp
+	sessMu.Unlock()
+	return token, nil
 }
 
 func validSession(r *http.Request) bool {
@@ -683,21 +931,34 @@ func validSession(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	parts := strings.SplitN(c.Value, ".", 2)
-	if len(parts) != 2 {
+	parts := strings.Split(c.Value, ".")
+	if len(parts) != 3 {
 		return false
 	}
-	expiry, err := strconv.ParseInt(parts[0], 16, 64)
+	expiry, err := strconv.ParseInt(parts[1], 16, 64)
 	if err != nil || time.Now().Unix() > expiry {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(signSession(expiry)), []byte(c.Value)) == 1
+	mac := hmac.New(sha256.New, authSecret)
+	fmt.Fprintf(mac, "%s|%d", parts[0], expiry)
+	got, err := hex.DecodeString(parts[2])
+	if err != nil || len(got) != mac.Size() {
+		return false
+	}
+	if subtle.ConstantTimeCompare(mac.Sum(nil), got) != 1 {
+		return false
+	}
+	sessMu.Lock()
+	registered := sessions[parts[0]]
+	sessMu.Unlock()
+	// 会话必须存在于服务端表（退出/重启/清理后即吊销）
+	return registered == expiry
 }
 
 // requireAuth 包一层站点密码校验（未设密码时直接放行）
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if sitePassword == "" || validSession(r) {
+		if !authOn || validSession(r) {
 			next(w, r)
 			return
 		}
@@ -708,29 +969,35 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 func loginLocked(ip string) bool {
 	failMu.Lock()
 	defer failMu.Unlock()
-	return time.Now().Before(failUntil[ip])
+	st := failIP[ip]
+	return st != nil && time.Now().Before(st.until)
 }
 
 func recordLoginFail(ip string) {
 	failMu.Lock()
 	defer failMu.Unlock()
-	failCount[ip]++
-	if failCount[ip] >= maxLoginAttempts {
-		failUntil[ip] = time.Now().Add(time.Duration(lockMinutes) * time.Minute)
-		delete(failCount, ip)
+	st := failIP[ip]
+	if st == nil {
+		st = &failState{}
+		failIP[ip] = st
+	}
+	st.count++
+	st.last = time.Now()
+	if st.count >= maxLoginAttempts {
+		st.until = time.Now().Add(time.Duration(lockMinutes) * time.Minute)
+		st.count = 0
 	}
 }
 
 func clearLoginFails(ip string) {
 	failMu.Lock()
 	defer failMu.Unlock()
-	delete(failCount, ip)
-	delete(failUntil, ip)
+	delete(failIP, ip)
 }
 
 // POST /api/login {"password": "..."}
 func login(w http.ResponseWriter, r *http.Request) {
-	if sitePassword == "" {
+	if !authOn {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
@@ -744,35 +1011,50 @@ func login(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := clientIP(r)
 	if loginLocked(ip) {
+		w.Header().Set("Retry-After", strconv.Itoa(lockMinutes*60))
 		fail(w, http.StatusTooManyRequests,
 			fmt.Sprintf("尝试次数过多，请 %d 分钟后再试", lockMinutes))
 		return
 	}
-	if subtle.ConstantTimeCompare([]byte(body.Password), []byte(sitePassword)) != 1 {
+	if !checkPassword(body.Password) {
 		recordLoginFail(ip)
 		log.Printf("登录失败: %s", ip)
 		fail(w, http.StatusUnauthorized, "密码错误")
 		return
 	}
 	clearLoginFails(ip)
-	expiry := time.Now().Add(time.Duration(sessionDays) * 24 * time.Hour).Unix()
+	token, err := newSessionToken(time.Duration(sessionDays) * 24 * time.Hour)
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "会话生成失败")
+		return
+	}
+	// Secure：TLS 直连或可信反代声明了 X-Forwarded-Proto: https 时启用
+	secure := r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https")
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookie,
-		Value:    signSession(expiry),
+		Value:    token,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+		SameSite: http.SameSiteStrictMode,
 		MaxAge:   sessionDays * 24 * 3600,
 	})
 	log.Printf("登录成功: %s", ip)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-// POST /api/logout
-func logout(w http.ResponseWriter, _ *http.Request) {
+// POST /api/logout —— 注销：吊销服务端会话（不只是删 Cookie）
+func logout(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(sessionCookie); err == nil {
+		if parts := strings.Split(c.Value, "."); len(parts) == 3 {
+			sessMu.Lock()
+			delete(sessions, parts[0])
+			sessMu.Unlock()
+		}
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/",
-		HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: -1,
+		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode, MaxAge: -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -792,8 +1074,7 @@ func exportZip(w http.ResponseWriter, r *http.Request) {
 	touch(slug)
 
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition",
-		fmt.Sprintf("attachment; filename*=UTF-8''%q", slug+".zip"))
+	w.Header().Set("Content-Disposition", dispositionHeader("attachment", slug+".zip"))
 
 	zw := zip.NewWriter(w)
 	defer zw.Close()
@@ -852,7 +1133,7 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 func health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
-		"auth":        sitePassword != "",
+		"auth":        authOn,
 		"max_note_mb": maxNote >> 20,
 		"max_file_mb": maxFile >> 20,
 	})
@@ -862,10 +1143,40 @@ func health(w http.ResponseWriter, _ *http.Request) {
 
 func janitor() {
 	cleanOnce() // 启动时先清一轮
+	cleanupRuntime()
 	t := time.NewTicker(5 * time.Minute)
 	for range t.C {
 		cleanOnce()
+		cleanupRuntime()
 	}
+}
+
+// cleanupRuntime 老化内存状态：过期会话、闲置令牌桶、过期登录失败记录
+func cleanupRuntime() {
+	now := time.Now().Unix()
+	sessMu.Lock()
+	for nonce, exp := range sessions {
+		if now > exp {
+			delete(sessions, nonce)
+		}
+	}
+	sessMu.Unlock()
+
+	limMu.Lock()
+	for ip, b := range limitBucks {
+		if time.Since(b.last) > 15*time.Minute {
+			delete(limitBucks, ip)
+		}
+	}
+	limMu.Unlock()
+
+	failMu.Lock()
+	for ip, st := range failIP {
+		if now > st.until.Unix() && time.Since(st.last) > 30*time.Minute {
+			delete(failIP, ip)
+		}
+	}
+	failMu.Unlock()
 }
 
 func cleanOnce() {
@@ -891,30 +1202,127 @@ func cleanOnce() {
 		}
 		noteTTL := ttlFor(slug)
 		if time.Since(info.ModTime()) > noteTTL {
-			log.Printf("清理: 笔记 /%s 超过 %v 无人访问，已删除", slug, noteTTL)
-			_ = os.RemoveAll(dir)
+			// 与写入操作互斥，避免删到正在保存的笔记（CWE-362）
+			writeMu.Lock()
+			if fi, err := os.Stat(np); err == nil && time.Since(fi.ModTime()) > noteTTL {
+				log.Printf("清理: 笔记 /%s 超过 %v 无人访问，已删除", slug, noteTTL)
+				_ = os.RemoveAll(dir)
+			}
+			writeMu.Unlock()
 		}
 	}
+}
+
+// ---------- 安全响应头 & 全局限速中间件 ----------
+
+// securityHeaders 为所有响应补齐安全头（页面 CSP 收紧到同源；/f/ 附件由处理器覆盖为 sandbox）
+func securityHeaders(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		h := w.Header()
+		h.Set("Content-Security-Policy",
+			"default-src 'self'; img-src 'self' data:; script-src 'self'; style-src 'self'; "+
+				"connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
+		h.Set("X-Frame-Options", "DENY")
+		h.Set("Referrer-Policy", "no-referrer") // 笔记地址即凭据，禁止外泄给第三方站点
+		h.Set("X-Content-Type-Options", "nosniff")
+		h.Set("Permissions-Policy", "geolocation=(), camera=(), microphone=(), payment=()")
+		p := r.URL.Path
+		if strings.HasPrefix(p, "/api/") || !strings.HasPrefix(p, "/static/") {
+			h.Set("Cache-Control", "no-store")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// rateLimit 每 IP 全局令牌桶限速（防暴力扫描与资源耗尽）
+func rateLimit(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ip := clientIP(r)
+		now := time.Now()
+		limMu.Lock()
+		b := limitBucks[ip]
+		if b == nil {
+			if len(limitBucks) > 100000 { // 兜底防内存膨胀
+				limitBucks = map[string]*limiter{}
+			}
+			b = &limiter{tokens: rateRPS, last: now}
+			limitBucks[ip] = b
+		}
+		b.tokens += now.Sub(b.last).Seconds() * rateRPS
+		if b.tokens > rateRPS*2 { // 突发上限 2 秒量
+			b.tokens = rateRPS * 2
+		}
+		b.last = now
+		ok := b.tokens >= 1
+		if ok {
+			b.tokens--
+		}
+		limMu.Unlock()
+		if !ok {
+			w.Header().Set("Retry-After", "2")
+			fail(w, http.StatusTooManyRequests, "请求过于频繁，请稍后再试")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // ---------- 入口 ----------
 
 func main() {
-	loadConfig()
+	// sznote -hash <密码>：生成 PBKDF2 哈希，填入 config.json 的 server.password_hash
+	if len(os.Args) > 1 && os.Args[1] == "-hash" {
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "用法: sznote -hash <密码>")
+			os.Exit(2)
+		}
+		salt := make([]byte, 16)
+		if _, err := rand.Read(salt); err != nil {
+			log.Fatal("生成盐失败: ", err)
+		}
+		key := pbkdf2Key([]byte(os.Args[2]), salt, pbkdf2Iterations, 32)
+		fmt.Printf("pbkdf2$%d$%s$%s\n", pbkdf2Iterations, hex.EncodeToString(salt), hex.EncodeToString(key))
+		return
+	}
 
-	if err := os.MkdirAll(notesRoot(), 0o755); err != nil {
+	loadConfig()
+	authOn = sitePassword != "" || passwordHash != ""
+
+	// 启动安全检查：监听全部网卡却不设密码时，必须显式声明接受匿名访问（CWE-306）
+	if !authOn && !allowAnonymous {
+		log.Printf("安全检查未通过：未设置 server.password / server.password_hash / SZN_PASSWORD")
+		log.Fatal("拒绝启动：当前将监听所有网卡但无访问密码。请设置密码（推荐），" +
+			"或在 config.json 的 security.allow_anonymous 设为 true（仅限完全可信的内网）")
+	}
+
+	if err := os.MkdirAll(notesRoot(), 0o700); err != nil {
 		log.Fatalf("无法创建数据目录 %s: %v", notesRoot(), err)
 	}
-	if sitePassword != "" {
+	if authOn {
 		authSecret = make([]byte, 32)
 		if _, err := rand.Read(authSecret); err != nil {
 			log.Fatal("生成会话密钥失败: ", err)
 		}
-		log.Printf("站点密码保护已启用（会话有效期 %d 天）", sessionDays)
+		if passwordHash != "" {
+			log.Printf("站点密码保护已启用（PBKDF2 哈希校验，会话有效期 %d 天）", sessionDays)
+		} else {
+			log.Printf("站点密码保护已启用（会话有效期 %d 天）", sessionDays)
+		}
+	}
+	if !authOn {
+		log.Printf("!!! 匿名访问模式（allow_anonymous=true）：任何人可读写全部笔记，切勿暴露到公网 !!!")
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("GET /static/", http.FileServer(http.FS(staticFS)))
+	// 静态文件：禁用目录索引（CWE-548），拒绝路径穿越
+	mux.HandleFunc("GET /static/", func(w http.ResponseWriter, r *http.Request) {
+		p := path.Clean(strings.TrimPrefix(r.URL.Path, "/static/"))
+		if p == "." || strings.HasPrefix(p, "..") || strings.HasSuffix(r.URL.Path, "/") {
+			http.NotFound(w, r)
+			return
+		}
+		http.ServeFileFS(w, r, staticFS, "static/"+p)
+	})
 	mux.HandleFunc("GET /api/health", health)
 	mux.HandleFunc("POST /api/login", login)
 	mux.HandleFunc("POST /api/logout", logout)
@@ -930,14 +1338,25 @@ func main() {
 	go janitor()
 
 	log.Printf("szNote 已启动: http://0.0.0.0:%s  配置=%s", port, configPath)
-	log.Printf("  数据目录=%s  默认有效期=%v  正文上限=%dMB  单文件上限=%dMB",
-		dataDir, ttl, maxNote>>20, maxFile>>20)
+	log.Printf("  数据目录=%s  默认有效期=%v  正文上限=%dMB  单文件上限=%dMB  笔记总上限=%dMB",
+		dataDir, ttl, maxNote>>20, maxFile>>20, maxNoteTotal>>20)
 	if rateKBPS > 0 {
 		log.Printf("  附件下载限速=%d KB/s（0 = 不限速）  文本预览上限=%dKB", rateKBPS, inlinePreviewKB)
 	} else {
 		log.Printf("  附件下载限速=关闭  文本预览上限=%dKB", inlinePreviewKB)
 	}
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	log.Printf("  全局限速=%.0f req/s/IP  可信反代=%d 条", rateRPS, len(trustedNets))
+
+	srv := &http.Server{
+		Addr:              ":" + port,
+		Handler:           securityHeaders(rateLimit(mux)),
+		ReadHeaderTimeout: 10 * time.Second,   // 防 Slowloris（CWE-400）
+		ReadTimeout:       10 * time.Minute,   // 覆盖大文件慢速上传
+		WriteTimeout:      0,                  // 大文件限速下载可能很慢，交给 IdleTimeout
+		IdleTimeout:       90 * time.Second,
+		MaxHeaderBytes:    16 << 10,
+	}
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
