@@ -15,9 +15,10 @@ RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
 COPY --from=build /sznote /app/sznote
 # 许可文本随镜像分发（MIT 要求保留版权与许可声明）；源码见 https://github.com/zsgm-bit/szNote
-COPY LICENSE /app/
-# 内置一份默认配置；实际部署用 volume 挂载覆盖（见 docker-compose.yml）
-COPY config.json /app/config.json
+COPY LICENSE README.md /app/
+# 内置一份发布默认配置（fail-closed：未设密码时拒绝启动）；
+# 实际部署用 volume 挂载覆盖（见 docker-compose.yml），改配置不用重建镜像
+COPY config.default.json /app/config.json
 # 配置模板（字段说明齐全），改配置时可参照
 COPY config.example.json /app/config.example.json
 VOLUME /app/data

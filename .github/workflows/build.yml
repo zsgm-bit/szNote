@@ -177,14 +177,19 @@ jobs:
       - name: 打包
         run: |
           set -euo pipefail
-          # 分发物随附许可文本（MIT 要求保留版权与许可声明）与配置模板
-          cp LICENSE config.example.json dist/
+          # 分发物随附：许可文本（MIT 要求保留版权与许可声明）
+          #              + 默认配置 config.json（解压即可改，程序只读这个文件名）
+          #              + 配置模板 config.example.json（全字段中文注释）
+          #              + README.md（离线可查的使用文档）
+          cp LICENSE config.example.json README.md dist/
+          cp config.default.json dist/config.json
           cd dist
+          FILES="LICENSE config.json config.example.json README.md"
           for f in sznote_*; do
             case "$f" in
               *.tar.gz|*.zip) continue ;;   # 已打包产物，跳过（保证重复执行幂等）
-              *.exe) zip -q "${f%.exe}.zip" "$f" LICENSE config.example.json ;;
-              *)     tar -czf "$f.tar.gz" "$f" LICENSE config.example.json ;;
+              *.exe) zip -q "${f%.exe}.zip" "$f" $FILES ;;
+              *)     tar -czf "$f.tar.gz" "$f" $FILES ;;
             esac
           done
           sha256sum *.tar.gz *.zip > checksums.txt
@@ -201,9 +206,11 @@ jobs:
           body: |
             szNote ${{ github.ref_name }}
 
-            - 单二进制，无运行时依赖；下载对应平台文件解压即用
-            - 首次运行：`cp config.example.json config.json`，用 `./sznote -hash '你的密码'` 生成哈希
-              填入 `server.password_hash`（仅内网免密试跑才把 `security.allow_anonymous` 设为 `true`）
+            **压缩包内含**：二进制 + `config.json`（默认配置，直接改这个）+ `config.example.json`（全字段注释模板）+ `README.md` + `LICENSE`
+
+            - 单二进制，无运行时依赖；解压即用
+            - 首次运行：`./sznote -hash '你的密码'`，把输出整行填进 `config.json` 的 `server.password_hash`，再 `./sznote`
+            - 仅内网免密试跑：把 `config.json` 的 `security.allow_anonymous` 改为 `true`（公网禁止）
             - Docker: `docker run -d -p 9720:9720 -v $PWD/data:/app/data ghcr.io/${{ github.repository }}:${{ github.ref_name }}`
             - 校验: `sha256sum -c checksums.txt`
 

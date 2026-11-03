@@ -47,17 +47,15 @@ docker compose up -d --build
 
 ### 方式二：单二进制
 
-从 [Releases](https://github.com/zsgm-bit/szNote/releases) 下载对应平台文件（压缩包内已含
-`config.example.json`），解压后：
+从 [Releases](https://github.com/zsgm-bit/szNote/releases) 下载对应平台的压缩包，**包内已含**
+二进制 + `config.json`（默认配置）+ `config.example.json`（注释模板）+ `README.md` + `LICENSE`，
+解压后：
 
 ```bash
-# 1. 生成配置：模板复制成实际生效的 config.json
-cp config.example.json config.json
+# 1. 生成密码哈希（推荐；也可直接在 config.json 里填明文 server.password）
+./sznote -hash 'your-password'      # 输出 pbkdf2$... 整行填到 config.json 的 server.password_hash
 
-# 2. 生成密码哈希（推荐；也可直接在 config.json 里填明文 server.password）
-./sznote -hash 'your-password'      # 输出 pbkdf2$... 整行填到 server.password_hash
-
-# 3. 启动（Linux / macOS）
+# 2. 启动（Linux / macOS）
 chmod +x sznote_linux_amd64 && ./sznote_linux_amd64
 
 # Windows
@@ -84,12 +82,16 @@ make run                             # 构建并运行
 
 ## 配置
 
-仓库里有**两个配置文件**，含义不同：
+仓库里有**三个配置文件**，含义不同：
 
 | 文件 | 作用 | 是否被程序读取 |
 |---|---|---|
-| `config.json` | 实际生效的配置 | ✅ 是 |
+| `config.json` | 实际生效的配置（本仓库这份是作者内网免密模式，供 `docker compose` 直接使用） | ✅ 是 |
+| `config.default.json` | **发布默认配置**：打进 Release 压缩包时改名为 `config.json`，`allow_anonymous: false`（未设密码拒绝启动） | ❌ 否（打包用） |
 | `config.example.json` | 配置模板：字段含义、可选值、推荐值都写在里面 | ❌ 否（仅作参照/复制源） |
+
+> Release 包内的 `config.json` 由 `config.default.json` 生成，是**安全默认**（无密码则拒绝启动）；
+> 想内网免密使用，把它里面的 `security.allow_anonymous` 改为 `true` 即可。
 
 升级或重新部署时，先 `cp config.example.json config.json` 再改，避免漏掉新版本新增的字段。
 所有参数集中在 `config.json` 里，改完重启生效。
@@ -193,6 +195,7 @@ make clean
 .
 ├── main.go                 # 全部后端逻辑（标准库）
 ├── config.json             # 实际生效的配置（程序读取）
+├── config.default.json     # 发布默认配置（打包时改名为 config.json）
 ├── config.example.json     # 配置模板（带注释，不被读取）
 ├── static/                 # 前端（HTML/CSS/JS + 内嵌 marked、DOMPurify）
 ├── Dockerfile              # 两阶段构建，产物 ~15MB
