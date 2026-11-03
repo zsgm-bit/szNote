@@ -100,19 +100,28 @@ button.ghost { background: transparent; }
 }
 .brand { color: var(--text); font-weight: 600; text-decoration: none; font-size: 15px; flex-shrink: 0; }
 .top-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
-/* 状态提示：顶栏正中间 */
-#status {
+/* 状态提示：顶栏正中间（模式指示 + 保存状态） */
+#statusWrap {
   position: absolute;
   left: 50%;
   top: 50%;
   transform: translate(-50%, -50%);
+  display: flex;
+  align-items: center;
+  gap: 12px;
   font-size: 12px;
   white-space: nowrap;
   pointer-events: none;
 }
+#status { color: var(--muted); }
+/* 模式指示：不同页面状态用不同颜色 */
+#modeTag { font-weight: 600; letter-spacing: 1px; }
+#modeTag.mode-edit { color: var(--muted); }
+#modeTag.mode-split { color: var(--accent); }
+#modeTag.mode-preview { color: var(--danger); }
 @media (max-width: 1100px) {
   /* 窄屏放不下居中，回到品牌右侧顺排 */
-  #status { position: static; transform: none; }
+  #statusWrap { position: static; transform: none; }
 }
 #ttlSelect {
   padding: 7px 8px;
@@ -187,9 +196,10 @@ button.ghost { background: transparent; }
   flex: 1;
   display: flex;
   min-height: 0;
+  min-width: 0;
 }
 #content {
-  flex: 1;
+  flex: 1 1 auto;
   resize: none;
   border: none;
   outline: none;
@@ -199,18 +209,32 @@ button.ghost { background: transparent; }
   line-height: 1.7;
   background: var(--panel);
   color: var(--text);
+  min-width: 120px;
 }
 #preview {
-  flex: 1;
+  flex: 1 1 0;
   overflow: auto;
   padding: 20px 28px;
   background: var(--panel);
-  border-left: 1px solid var(--line);
+  min-width: 120px;
+}
+/* 分屏时编辑区宽度由拖动决定 */
+#panes.previewing:not(.fullpreview) #content {
+  flex: 0 0 var(--edw, 50%);
 }
 
-/* 附件面板（编辑区右侧） */
+/* 栏间分隔条：可拖动调整各栏宽度 */
+.divider { flex-shrink: 0; background: transparent; transition: background .12s; z-index: 5; }
+.divider.v { width: 5px; cursor: col-resize; margin: 0 -1px; }
+.divider.h { width: 5px; cursor: col-resize; }
+.divider:hover, .divider.active { background: var(--accent); opacity: .45; }
+#panes:not(.previewing) #splitV,
+#panes.fullpreview #splitV { display: none; }
+
+/* 附件面板（编辑区右侧），宽度可拖动；拖到最窄时只留序号和下载按钮 */
 #filesPanel {
-  width: 260px;
+  width: var(--filesw, 260px);
+  min-width: 44px;
   border-left: 1px solid var(--line);
   background: var(--bg);
   padding: 14px;
@@ -227,6 +251,17 @@ button.ghost { background: transparent; }
   padding: 6px 4px;
   border-bottom: 1px dashed var(--line);
 }
+.fidx { display: none; font-size: 12px; color: var(--muted); flex-shrink: 0; min-width: 20px; }
+#filesPanel.mini { padding: 10px 6px; }
+#filesPanel.mini h3 { font-size: 12px; margin-bottom: 6px; }
+#filesPanel.mini .fidx { display: inline; }
+#filesPanel.mini .fname,
+#filesPanel.mini .fsize,
+#filesPanel.mini .fthumb,
+#filesPanel.mini .ficon,
+#filesPanel.mini .fbtn.del,
+#filesPanel.mini #filesEmpty { display: none; }
+#filesPanel.mini #fileList li { justify-content: space-between; }
 .fthumb {
   width: 36px;
   height: 36px;

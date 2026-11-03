@@ -60,8 +60,7 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
   }
 });
 
-/* 净化配置：默认白名单会放行 form/input/style 等标签，可被用于同源钓鱼与界面伪装，
-   这里显式禁掉主动内容标签与危险属性（服务端 CSP form-action 'none' 是第二道防线） */
+/* 净化配置：禁掉表单/样式等标签，防止笔记内伪装登录框 */
 const PURIFY_CFG = {
   FORBID_TAGS: ["form", "input", "button", "select", "textarea", "option", "optgroup",
     "style", "link", "meta", "base", "frame", "frameset", "object", "embed"],
@@ -300,8 +299,7 @@ function setupEditor() {
       const m = lines[idx].trim().match(IMG_LINE);
       if (m) hit = { alt: m[1], url: m[2] };
     }
-    /* 只预览本站附件（/f/）与 data: 图片；笔记里的任意外链不加载，
-       防止第三方追踪与浏览器侧内网探测 */
+    /* 只加载本站附件与 data: 图片，外链图片不请求 */
     const safeImg = hit && (hit.url.startsWith("/f/") || hit.url.startsWith("data:image/"));
     if (hit && safeImg) {
       if (hoverImg.getAttribute("src") !== hit.url) {
@@ -346,10 +344,75 @@ function setupEditor() {
     if (dirty) { e.preventDefault(); e.returnValue = ""; }
   });
 
+  setupSplitters();
+  applySavedWidths();
+
   /* 宽屏默认分屏：粘贴图片/文字当场就能看到效果 */
   setPreviewMode(window.innerWidth > 860 ? 1 : 0);
 
   load();
+}
+
+/* ---------- 三栏拖动：编辑区 | 预览区 | 附件面板 ---------- */
+
+function setupSplitters() {
+  const v = $("splitV");
+  const h = $("splitH");
+
+  /* 编辑/预览分界：按 #panes 宽度的百分比调整 */
+  v.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    v.classList.add("active");
+    const panes = $("panes");
+    const move = (ev) => {
+      const rect = panes.getBoundingClientRect();
+      let pct = ((ev.clientX - rect.left) / rect.width) * 100;
+      pct = Math.min(85, Math.max(15, pct));
+      panes.style.setProperty("--edw", pct.toFixed(1) + "%");
+      localStorage.setItem("szn.edw", pct.toFixed(1));
+    };
+    const up = () => {
+      v.classList.remove("active");
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+    };
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+  });
+
+  /* 附件面板宽度：拖到 88px 以下进入 mini 模式（只显示序号和下载按钮） */
+  h.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    h.classList.add("active");
+    const move = (ev) => {
+      let w = innerWidth - ev.clientX;
+      w = Math.min(480, Math.max(44, w));
+      $("filesPanel").style.setProperty("--filesw", w + "px");
+      localStorage.setItem("szn.filesw", String(w));
+      updateFilesMini(w);
+    };
+    const up = () => {
+      h.classList.remove("active");
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", up);
+    };
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", up);
+  });
+}
+
+function applySavedWidths() {
+  const edw = parseFloat(localStorage.getItem("szn.edw"));
+  if (edw >= 15 && edw <= 85) $("panes").style.setProperty("--edw", edw + "%");
+  const fw = parseInt(localStorage.getItem("szn.filesw"), 10);
+  if (fw >= 44 && fw <= 480) {
+    $("filesPanel").style.setProperty("--filesw", fw + "px");
+    updateFilesMini(fw);
+  }
+}
+
+function updateFilesMini(w) {
+  $("filesPanel").classList.toggle("mini", w < 88);
 }
 
 function copyLink() { copyText(location.origin + "/" + slug); }
@@ -436,6 +499,13 @@ function setPreviewMode(mode) {
   const btn = $("btnPreview");
   btn.textContent = mode === 2 ? "全屏" : mode === 1 ? "分屏" : "预览";
   btn.title = mode === 2 ? "返回编辑 (Ctrl+P)" : "预览：点一下分屏，再点一下全屏 (Ctrl+P)";
+  /* 顶栏中间的模式指示，颜色随状态变化 */
+  const tag = $("modeTag");
+  tag.classList.toggle("hidden", false);
+  tag.classList.remove("mode-edit", "mode-split", "mode-preview");
+  if (mode === 0) { tag.textContent = "编辑"; tag.classList.add("mode-edit"); }
+  else if (mode === 1) { tag.textContent = "分屏"; tag.classList.add("mode-split"); }
+  else { tag.textContent = "预览"; tag.classList.add("mode-preview"); }
   if (mode > 0) render();
 }
 
@@ -488,9 +558,16 @@ function renderFiles(files) {
   const ul = $("fileList");
   ul.innerHTML = "";
   $("filesEmpty").style.display = files.length ? "none" : "";
-  for (const f of files) {
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
     const li = document.createElement("li");
-    li.title = f.name; // 悬停显示完整文件名
+    li.title = f.name; // 悬停显示完整文件名（mini 模式下唯一的文件名入口）
+
+    /* 序号：面板拖到最窄时替代文件名显示 */
+    const idx = document.createElement("span");
+    idx.className = "fidx";
+    idx.textContent = (i + 1) + ".";
+
     let thumb;
     if (IMG_EXT.test(f.name)) {
       thumb = document.createElement("img");
@@ -536,7 +613,7 @@ function renderFiles(files) {
       refreshFiles();
     };
 
-    li.append(thumb, name, size, dl, del);
+    li.append(idx, thumb, name, size, dl, del);
     ul.appendChild(li);
   }
 }

@@ -32,6 +32,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -80,38 +81,21 @@ type fileConfig struct {
 }
 
 var (
-	port    = "9720"
+	port    = "9720" // 监听端口（热加载不支持，改后需重启）
 	dataDir = "./data"
-	ttl     = 24 * time.Hour
-	maxNote = int64(5) << 20  // 笔记正文上限，默认 5MB
-	maxFile = int64(50) << 20 // 单文件上限，默认 50MB
-	// 文本类附件在线预览的大小上限（KB），超过则改为下载
-	inlinePreviewKB = 512
-	// 每连接下载限速（KB/s），0 = 不限速
-	rateKBPS = 100
 
 	slugRe   = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$`)
 	reserved = map[string]bool{"static": true, "api": true, "f": true, "favicon.ico": true}
 
 	writeMu sync.Mutex // 序列化所有写操作，避免并发写坏文件
 
-	sitePassword = "" // 站点密码（明文），与 password_hash 二选一
-	passwordHash = "" // 站点密码（PBKDF2 哈希），优先于明文
-	authOn       bool // 是否启用鉴权（password / password_hash 任一非空）
-	authSecret   []byte
-	sessionDays  = 7 // 登录会话有效期（天）
-
-	maxLoginAttempts = 5  // 连续失败多少次锁 IP
-	lockMinutes      = 10 // 锁定时长（分钟）
-
-	maxNoteTotal = int64(200) << 20 // 单笔记含附件总大小上限
-	rateRPS      = 50.0             // 每 IP 全局请求速率（req/s）
-
-	allowAnonymous = false // 显式接受无密码匿名访问
-
-	trustedNets []*net.IPNet // 可信反代网段，命中才信任 X-Forwarded-For
+	authSecret []byte // 会话签名密钥，进程生命周期内固定
 
 	configPath = "config.json" // 实际加载的配置文件路径（日志用）
+
+	// 热加载的运行配置：watcher 检测到 config.json 变化后整体替换，
+	// 读取侧通过 cfg() 取一致性快照
+	hot atomic.Pointer[hotConfig]
 
 	// 登录失败锁定状态（带时间戳，可被 janitor 老化清理）
 	failMu sync.Mutex
@@ -123,6 +107,33 @@ var (
 	limMu      sync.Mutex
 	limitBucks = map[string]*limiter{}
 )
+
+// hotConfig 是可热加载的运行时配置集合。整体替换、整体读取，避免半新半旧。
+type hotConfig struct {
+	authOn       bool
+	sitePassword string // 明文密码，与 passwordHash 二选一
+	passwordHash string // PBKDF2 哈希，优先于明文
+	allowAnonymous bool
+
+	sessionDays int
+
+	maxNote         int64         // 笔记正文上限
+	maxFile         int64         // 单附件上限
+	maxNoteTotal    int64         // 单笔记含附件总上限
+	inlinePreviewKB int           // 文本附件在线预览上限（KB）
+	ttl             time.Duration // 默认有效期
+
+	rateKBPS int // 每连接下载限速（KB/s），0=不限速
+	rateRPS  float64
+
+	maxLoginAttempts int
+	lockMinutes      int
+
+	trustedNets []*net.IPNet
+}
+
+// cfg 返回当前配置快照
+func cfg() *hotConfig { return hot.Load() }
 
 // failState 单个 IP 的登录失败状态
 type failState struct {
@@ -175,107 +186,127 @@ func defaultConfig() fileConfig {
 
 // loadConfig 按「内置默认值 → config.json → 环境变量」的优先级装配配置。
 // 环境变量优先级最高，便于在容器/CI 里临时覆盖单个参数。
-func loadConfig() {
+// initial=true 用于进程启动（port/data_dir 一并生效）；
+// initial=false 用于热加载（port/data_dir 保持原值，这两项改后需重启）。
+// 返回 false 表示 config.json 存在但解析失败（热加载时应保留旧配置）。
+func loadConfig(initial bool) bool {
 	def := defaultConfig()
-	cfg := def
+	fc := def
 
 	// 配置文件位置：SZN_CONFIG（或旧名 QN_CONFIG），默认工作目录下 config.json
 	path := envOr("SZN_CONFIG", "config.json")
 	configPath = path
+	parseOK := true
 	if b, err := os.ReadFile(path); err == nil {
 		tmp := def // 先填默认值再解 JSON，缺字段就保留默认
 		if err := json.Unmarshal(b, &tmp); err != nil {
-			log.Printf("配置: %s 解析失败，全部改用内置默认值（%v）", path, err)
+			log.Printf("config: failed to parse %s, keeping previous values (%v)", path, err)
+			parseOK = false
 		} else {
-			cfg = tmp
-			log.Printf("配置: 已加载 %s", path)
+			fc = tmp
+			log.Printf("config: loaded %s", path)
 		}
 	} else if !os.IsNotExist(err) {
-		log.Printf("配置: 读取 %s 失败，改用内置默认值（%v）", path, err)
+		log.Printf("config: failed to read %s, using built-in defaults (%v)", path, err)
 	} else {
-		log.Printf("配置: 未找到 %s，使用内置默认值（同目录 config.example.json 是带注释的模板，复制一份改名为 config.json 即可）", path)
+		log.Printf("config: %s not found, using built-in defaults (copy config.example.json to config.json to customize)", path)
 	}
 
-	// 应用到运行时变量
-	port = strconv.Itoa(int(cfg.Server.Port))
-	sitePassword = cfg.Server.Password
-	passwordHash = strings.TrimSpace(cfg.Server.PasswordHash)
-	sessionDays = cfg.Server.SessionDays
-	dataDir = cfg.Storage.DataDir
-	maxNote = int64(cfg.Storage.MaxNoteMB) << 20
-	maxFile = int64(cfg.Storage.MaxFileMB) << 20
-	inlinePreviewKB = cfg.Storage.InlinePreviewKB
-	maxNoteTotal = int64(cfg.Storage.MaxNoteTotalMB) << 20
-	ttl = time.Duration(cfg.Policy.DefaultTTLHours) * time.Hour
-	rateKBPS = cfg.Policy.RateKBPS
-	maxLoginAttempts = cfg.Security.MaxLoginAttempts
-	lockMinutes = cfg.Security.LockMinutes
-	allowAnonymous = cfg.Security.AllowAnonymous
-	if cfg.Security.RateRPS > 0 {
-		rateRPS = float64(cfg.Security.RateRPS)
+	// 端口与数据目录仅启动时生效（热加载不改动，避免运行中切换存储位置）
+	if initial {
+		port = strconv.Itoa(int(fc.Server.Port))
+		dataDir = fc.Storage.DataDir
+		if v := envOr("SZN_PORT", ""); v != "" {
+			port = v
+		}
+		if v := envOr("SZN_DATA", ""); v != "" {
+			dataDir = v
+		}
 	}
-	trustedNets = parseCIDRs(cfg.Security.TrustedProxies)
 
-	// 环境变量覆盖（旧版 QN_ 前缀同样兼容）
-	if v := envOr("SZN_PORT", ""); v != "" {
-		port = v
+	h := &hotConfig{
+		sitePassword:     fc.Server.Password,
+		passwordHash:     strings.TrimSpace(fc.Server.PasswordHash),
+		sessionDays:      fc.Server.SessionDays,
+		maxNote:          int64(fc.Storage.MaxNoteMB) << 20,
+		maxFile:          int64(fc.Storage.MaxFileMB) << 20,
+		maxNoteTotal:     int64(fc.Storage.MaxNoteTotalMB) << 20,
+		inlinePreviewKB:  fc.Storage.InlinePreviewKB,
+		ttl:              time.Duration(fc.Policy.DefaultTTLHours) * time.Hour,
+		rateKBPS:         fc.Policy.RateKBPS,
+		maxLoginAttempts: fc.Security.MaxLoginAttempts,
+		lockMinutes:      fc.Security.LockMinutes,
+		allowAnonymous:   fc.Security.AllowAnonymous,
+		rateRPS:          50,
 	}
+	if fc.Security.RateRPS > 0 {
+		h.rateRPS = float64(fc.Security.RateRPS)
+	}
+	h.trustedNets = parseCIDRs(fc.Security.TrustedProxies)
+	h.authOn = h.sitePassword != "" || h.passwordHash != ""
+
+	// 环境变量覆盖（旧版 QN_ 前缀同样兼容）；SZN_PORT / SZN_DATA 只在启动时生效
 	if v := envOr("SZN_PASSWORD", ""); v != "" {
-		sitePassword = v
+		h.sitePassword = v
+		h.authOn = true
 	}
 	if n, ok := envIntSet("SZN_ALLOW_ANONYMOUS"); ok {
-		allowAnonymous = n != 0
-	}
-	if v := envOr("SZN_DATA", ""); v != "" {
-		dataDir = v
+		h.allowAnonymous = n != 0
 	}
 	if n, ok := envIntSet("SZN_SESSION_DAYS"); ok {
-		sessionDays = n
+		h.sessionDays = n
 	}
 	if n, ok := envIntSet("SZN_MAX_NOTE_MB"); ok {
-		maxNote = int64(n) << 20
+		h.maxNote = int64(n) << 20
 	} else if n, ok := envIntSet("SZN_MAX_NOTE_KB"); ok { // 旧变量
-		maxNote = int64(n) << 10
+		h.maxNote = int64(n) << 10
 	}
 	if n, ok := envIntSet("SZN_MAX_FILE_MB"); ok {
-		maxFile = int64(n) << 20
+		h.maxFile = int64(n) << 20
 	}
 	if n, ok := envIntSet("SZN_INLINE_PREVIEW_KB"); ok {
-		inlinePreviewKB = n
+		h.inlinePreviewKB = n
 	}
 	if n, ok := envIntSet("SZN_TTL_HOURS"); ok {
-		ttl = time.Duration(n) * time.Hour
+		h.ttl = time.Duration(n) * time.Hour
 	}
 	if n, ok := envIntSet("SZN_RATE_KBPS"); ok {
-		rateKBPS = n
+		h.rateKBPS = n
 	}
 	if n, ok := envIntSet("SZN_MAX_LOGIN_ATTEMPTS"); ok {
-		maxLoginAttempts = n
+		h.maxLoginAttempts = n
 	}
 	if n, ok := envIntSet("SZN_LOCK_MINUTES"); ok {
-		lockMinutes = n
+		h.lockMinutes = n
 	}
 
 	// 兜底：避免 0 值把服务搞成不可用
-	if !validTTL(int(ttl.Hours())) {
-		log.Printf("配置: default_ttl_hours=%d 不在 24/72/120/168 之内，改用 24", int(ttl.Hours()))
-		ttl = 24 * time.Hour
+	if !validTTL(int(h.ttl.Hours())) {
+		log.Printf("config: default_ttl_hours=%d not in 24/72/120/168, using 24", int(h.ttl.Hours()))
+		h.ttl = 24 * time.Hour
 	}
-	if maxNote <= 0 {
-		maxNote = 5 << 20
+	if h.maxNote <= 0 {
+		h.maxNote = 5 << 20
 	}
-	if maxFile <= 0 {
-		maxFile = 50 << 20
+	if h.maxFile <= 0 {
+		h.maxFile = 50 << 20
 	}
-	if sessionDays <= 0 {
-		sessionDays = 7
+	if h.sessionDays <= 0 {
+		h.sessionDays = 7
 	}
-	if maxLoginAttempts <= 0 {
-		maxLoginAttempts = 5
+	if h.maxLoginAttempts <= 0 {
+		h.maxLoginAttempts = 5
 	}
-	if lockMinutes <= 0 {
-		lockMinutes = 10
+	if h.lockMinutes <= 0 {
+		h.lockMinutes = 10
 	}
+
+	// 热加载时解析失败不覆盖旧配置；启动时没有旧配置可保，照常落默认值
+	if !parseOK && !initial {
+		return false
+	}
+	hot.Store(h)
+	return true
 }
 
 // ---------- 工具函数 ----------
@@ -350,7 +381,7 @@ func ttlFor(slug string) time.Duration {
 		}
 		return time.Duration(m.TTLHours) * time.Hour
 	}
-	return ttl // 全局默认 QN_TTL_HOURS
+	return cfg().ttl // 全局默认 default_ttl_hours
 }
 
 // safeName 清洗上传文件名：去掉路径部分、控制字符与 Windows 非法字符
@@ -453,7 +484,8 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 	}
 	// JSON 转义会放大体积，请求体上限给正文上限的 2 倍 + 64KB 余量，
 	// 真正的正文上限在解码后按字符数严格校验
-	r.Body = http.MaxBytesReader(w, r.Body, maxNote*2+(1<<16))
+	c := cfg()
+	r.Body = http.MaxBytesReader(w, r.Body, c.maxNote*2+(1<<16))
 	var body struct {
 		Content  string `json:"content"`
 		TTLHours *int   `json:"ttl_hours"`
@@ -463,9 +495,9 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusRequestEntityTooLarge, "请求体无效或超过大小限制")
 		return
 	}
-	if int64(len(body.Content)) > maxNote {
+	if int64(len(body.Content)) > c.maxNote {
 		fail(w, http.StatusRequestEntityTooLarge,
-			fmt.Sprintf("正文超过上限（%d MB）", maxNote>>20))
+			fmt.Sprintf("正文超过上限（%d MB）", c.maxNote>>20))
 		return
 	}
 	if body.TTLHours != nil {
@@ -500,7 +532,7 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 			m.Plain = *body.Plain
 		}
 		if m.TTLHours == 0 { // 还没设过有效期：落成全局默认，避免 0 被当成无效值
-			m.TTLHours = int(ttl.Hours())
+			m.TTLHours = int(c.ttl.Hours())
 		}
 		if mb, err := json.Marshal(m); err == nil {
 			_ = os.WriteFile(metaPath(slug), mb, 0o600)
@@ -524,8 +556,9 @@ func upload(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "无效的笔记地址")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxFile+(1<<20))
-	// 内存阈值固定 8MB，超出部分自动落临时文件，避免并发上传放大内存（CWE-400）
+	c := cfg()
+	r.Body = http.MaxBytesReader(w, r.Body, c.maxFile+(1<<20))
+	// 内存阈值固定 8MB，超出部分自动落临时文件，避免并发上传放大内存
 	if err := r.ParseMultipartForm(8 << 20); err != nil {
 		fail(w, http.StatusBadRequest, "文件过大或表单无效")
 		return
@@ -573,8 +606,8 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 
-	// 单笔记总大小配额（防存储耗尽，CWE-400）
-	if maxNoteTotal > 0 {
+	// 单笔记总大小配额（防存储耗尽）
+	if c.maxNoteTotal > 0 {
 		var total int64
 		if entries, err := os.ReadDir(dir); err == nil {
 			for _, e := range entries {
@@ -585,9 +618,9 @@ func upload(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 		}
-		if total+hdr.Size > maxNoteTotal {
+		if total+hdr.Size > c.maxNoteTotal {
 			fail(w, http.StatusRequestEntityTooLarge,
-				fmt.Sprintf("附件总大小超过上限（%d MB）", maxNoteTotal>>20))
+				fmt.Sprintf("附件总大小超过上限（%d MB）", c.maxNoteTotal>>20))
 			return
 		}
 	}
@@ -614,7 +647,7 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	dst.Close()
 	touch(slug)
 
-	log.Printf("上传: /%s -> %s", slug, final)
+	log.Printf("upload: /%s -> %s", slug, final)
 	writeJSON(w, http.StatusOK, map[string]string{
 		"name": final,
 		"url":  "/f/" + slug + "/" + final,
@@ -712,10 +745,11 @@ func (rr *rateReader) Seek(offset int64, whence int) (int64, error) {
 
 // maybeThrottle 按配置给 Reader 套限速（rateKBPS<=0 时原样返回）
 func maybeThrottle(r io.ReadSeeker) io.ReadSeeker {
-	if rateKBPS <= 0 {
+	kbps := cfg().rateKBPS
+	if kbps <= 0 {
 		return r
 	}
-	return &rateReader{r: r, rate: float64(rateKBPS) * 1024, last: time.Now()}
+	return &rateReader{r: r, rate: float64(kbps) * 1024, last: time.Now()}
 }
 
 // textExts 可在线预览的纯文本类扩展名（日志、配置、脚本等，服务端零解析，直接按文本流出）
@@ -771,7 +805,7 @@ func serveFile(w http.ResponseWriter, r *http.Request) {
 	case textExts[ext]:
 		// 文本类：统一按 UTF-8 纯文本内嵌（浏览器零解析，服务端也只是流式转发）
 		ctype = "text/plain; charset=utf-8"
-		if inlinePreviewKB > 0 && info.Size() <= int64(inlinePreviewKB)<<10 {
+		if c := cfg(); c.inlinePreviewKB > 0 && info.Size() <= int64(c.inlinePreviewKB)<<10 {
 			disposition = "inline"
 		}
 	// SVG 可携带脚本/外部资源，一律强制下载；其余图片、音视频、PDF 可内嵌
@@ -816,14 +850,14 @@ func parseCIDRs(list []string) []*net.IPNet {
 		if _, n, err := net.ParseCIDR(s); err == nil {
 			nets = append(nets, n)
 		} else {
-			log.Printf("配置: trusted_proxies 中无法解析 %q，已忽略", s)
+			log.Printf("config: cannot parse trusted_proxies entry %q, skipped", s)
 		}
 	}
 	return nets
 }
 
 func ipTrusted(ip net.IP) bool {
-	for _, n := range trustedNets {
+	for _, n := range cfg().trustedNets {
 		if n.Contains(ip) {
 			return true
 		}
@@ -903,11 +937,12 @@ func verifyHash(password, stored string) bool {
 
 // checkPassword 校验登录密码（优先 password_hash；明文先哈希再恒定比较）
 func checkPassword(input string) bool {
-	if passwordHash != "" {
-		return verifyHash(input, passwordHash)
+	c := cfg()
+	if c.passwordHash != "" {
+		return verifyHash(input, c.passwordHash)
 	}
 	a := sha256.Sum256([]byte(input))
-	b := sha256.Sum256([]byte(sitePassword))
+	b := sha256.Sum256([]byte(c.sitePassword))
 	return subtle.ConstantTimeCompare(a[:], b[:]) == 1
 }
 
@@ -960,7 +995,7 @@ func validSession(r *http.Request) bool {
 // requireAuth 包一层站点密码校验（未设密码时直接放行）
 func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !authOn || validSession(r) {
+		if !cfg().authOn || validSession(r) {
 			next(w, r)
 			return
 		}
@@ -976,6 +1011,7 @@ func loginLocked(ip string) bool {
 }
 
 func recordLoginFail(ip string) {
+	c := cfg()
 	failMu.Lock()
 	defer failMu.Unlock()
 	st := failIP[ip]
@@ -985,8 +1021,8 @@ func recordLoginFail(ip string) {
 	}
 	st.count++
 	st.last = time.Now()
-	if st.count >= maxLoginAttempts {
-		st.until = time.Now().Add(time.Duration(lockMinutes) * time.Minute)
+	if st.count >= c.maxLoginAttempts {
+		st.until = time.Now().Add(time.Duration(c.lockMinutes) * time.Minute)
 		st.count = 0
 	}
 }
@@ -999,7 +1035,8 @@ func clearLoginFails(ip string) {
 
 // POST /api/login {"password": "..."}
 func login(w http.ResponseWriter, r *http.Request) {
-	if !authOn {
+	c := cfg()
+	if !c.authOn {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 		return
 	}
@@ -1013,19 +1050,19 @@ func login(w http.ResponseWriter, r *http.Request) {
 	}
 	ip := clientIP(r)
 	if loginLocked(ip) {
-		w.Header().Set("Retry-After", strconv.Itoa(lockMinutes*60))
+		w.Header().Set("Retry-After", strconv.Itoa(c.lockMinutes*60))
 		fail(w, http.StatusTooManyRequests,
-			fmt.Sprintf("尝试次数过多，请 %d 分钟后再试", lockMinutes))
+			fmt.Sprintf("尝试次数过多，请 %d 分钟后再试", c.lockMinutes))
 		return
 	}
 	if !checkPassword(body.Password) {
 		recordLoginFail(ip)
-		log.Printf("登录失败: %s", ip)
+		log.Printf("login failed: %s", ip)
 		fail(w, http.StatusUnauthorized, "密码错误")
 		return
 	}
 	clearLoginFails(ip)
-	token, err := newSessionToken(time.Duration(sessionDays) * 24 * time.Hour)
+	token, err := newSessionToken(time.Duration(c.sessionDays) * 24 * time.Hour)
 	if err != nil {
 		fail(w, http.StatusInternalServerError, "会话生成失败")
 		return
@@ -1039,9 +1076,9 @@ func login(w http.ResponseWriter, r *http.Request) {
 		HttpOnly: true,
 		Secure:   secure,
 		SameSite: http.SameSiteStrictMode,
-		MaxAge:   sessionDays * 24 * 3600,
+		MaxAge:   cfg().sessionDays * 24 * 3600,
 	})
-	log.Printf("登录成功: %s", ip)
+	log.Printf("login ok: %s", ip)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
@@ -1133,11 +1170,12 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 
 // GET /api/health —— 健康检查（始终开放，auth 告诉前端是否需要登录）
 func health(w http.ResponseWriter, _ *http.Request) {
+	c := cfg()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":          true,
-		"auth":        authOn,
-		"max_note_mb": maxNote >> 20,
-		"max_file_mb": maxFile >> 20,
+		"auth":        c.authOn,
+		"max_note_mb": c.maxNote >> 20,
+		"max_file_mb": c.maxFile >> 20,
 	})
 }
 
@@ -1196,18 +1234,18 @@ func cleanOnce() {
 		info, err := os.Stat(np)
 		if err != nil {
 			// 没有 note.md 的空壳目录：按目录自身 mtime 判断
-			if di, err2 := e.Info(); err2 == nil && time.Since(di.ModTime()) > ttl {
-				log.Printf("清理: 移除空目录 %s", slug)
+			if di, err2 := e.Info(); err2 == nil && time.Since(di.ModTime()) > cfg().ttl {
+				log.Printf("cleanup: removed empty dir %s", slug)
 				_ = os.RemoveAll(dir)
 			}
 			continue
 		}
 		noteTTL := ttlFor(slug)
 		if time.Since(info.ModTime()) > noteTTL {
-			// 与写入操作互斥，避免删到正在保存的笔记（CWE-362）
+			// 与写入操作互斥，避免删到正在保存的笔记
 			writeMu.Lock()
 			if fi, err := os.Stat(np); err == nil && time.Since(fi.ModTime()) > noteTTL {
-				log.Printf("清理: 笔记 /%s 超过 %v 无人访问，已删除", slug, noteTTL)
+				log.Printf("cleanup: removed /%s (idle over %v)", slug, noteTTL)
 				_ = os.RemoveAll(dir)
 			}
 			writeMu.Unlock()
@@ -1239,6 +1277,7 @@ func securityHeaders(next http.Handler) http.Handler {
 // rateLimit 每 IP 全局令牌桶限速（防暴力扫描与资源耗尽）
 func rateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rps := cfg().rateRPS
 		ip := clientIP(r)
 		now := time.Now()
 		limMu.Lock()
@@ -1247,12 +1286,12 @@ func rateLimit(next http.Handler) http.Handler {
 			if len(limitBucks) > 100000 { // 兜底防内存膨胀
 				limitBucks = map[string]*limiter{}
 			}
-			b = &limiter{tokens: rateRPS, last: now}
+			b = &limiter{tokens: rps, last: now}
 			limitBucks[ip] = b
 		}
-		b.tokens += now.Sub(b.last).Seconds() * rateRPS
-		if b.tokens > rateRPS*2 { // 突发上限 2 秒量
-			b.tokens = rateRPS * 2
+		b.tokens += now.Sub(b.last).Seconds() * rps
+		if b.tokens > rps*2 { // 突发上限 2 秒量
+			b.tokens = rps * 2
 		}
 		b.last = now
 		ok := b.tokens >= 1
@@ -1275,51 +1314,52 @@ func main() {
 	// sznote -hash <密码>：生成 PBKDF2 哈希，填入 config.json 的 server.password_hash
 	if len(os.Args) > 1 && os.Args[1] == "-hash" {
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "用法: sznote -hash <密码>")
+			fmt.Fprintln(os.Stderr, "usage: sznote -hash <password>")
 			os.Exit(2)
 		}
 		salt := make([]byte, 16)
 		if _, err := rand.Read(salt); err != nil {
-			log.Fatal("生成盐失败: ", err)
+			log.Fatal("failed to generate salt: ", err)
 		}
 		key := pbkdf2Key([]byte(os.Args[2]), salt, pbkdf2Iterations, 32)
 		fmt.Printf("pbkdf2$%d$%s$%s\n", pbkdf2Iterations, hex.EncodeToString(salt), hex.EncodeToString(key))
 		return
 	}
 
-	loadConfig()
-	authOn = sitePassword != "" || passwordHash != ""
+	loadConfig(true)
+	start := cfg()
 
-	// 启动安全检查：监听全部网卡却不设密码时，必须显式声明接受匿名访问（CWE-306）
-	if !authOn && !allowAnonymous {
-		log.Printf("安全检查未通过：未设置 server.password / server.password_hash / SZN_PASSWORD")
-		log.Fatal("拒绝启动：当前将监听所有网卡但无访问密码。请设置密码（推荐），" +
-			"或在 config.json 的 security.allow_anonymous 设为 true（仅限完全可信的内网）。\n" +
-			"操作步骤：① 用 ./sznote -hash '你的密码' 生成哈希；" +
-			"② 填到同目录 config.json 的 server.password_hash；③ 重新启动。\n" +
-			"没有 config.json？把同目录的 config.example.json 复制一份并改名为 config.json。")
+	// 启动安全检查：监听全部网卡却不设密码时，必须显式声明接受匿名访问
+	if !start.authOn && !start.allowAnonymous {
+		log.Printf("security check failed: no server.password / server.password_hash / SZN_PASSWORD set")
+		log.Fatal("refusing to start: listening on all interfaces without an access password. " +
+			"Set server.password (or server.password_hash), " +
+			"or set security.allow_anonymous=true in config.json (trusted LAN only).\n" +
+			"Steps: 1) run ./sznote -hash 'your-password'; " +
+			"2) put the output into server.password_hash in config.json; 3) start again.\n" +
+			"No config.json? Copy config.example.json next to the binary and rename it to config.json.")
 	}
 
 	if err := os.MkdirAll(notesRoot(), 0o700); err != nil {
-		log.Fatalf("无法创建数据目录 %s: %v", notesRoot(), err)
+		log.Fatalf("failed to create data dir %s: %v", notesRoot(), err)
 	}
-	if authOn {
+	if start.authOn {
 		authSecret = make([]byte, 32)
 		if _, err := rand.Read(authSecret); err != nil {
-			log.Fatal("生成会话密钥失败: ", err)
+			log.Fatal("failed to generate session secret: ", err)
 		}
-		if passwordHash != "" {
-			log.Printf("站点密码保护已启用（PBKDF2 哈希校验，会话有效期 %d 天）", sessionDays)
+		if start.passwordHash != "" {
+			log.Printf("auth enabled (PBKDF2 hash, session %d days)", start.sessionDays)
 		} else {
-			log.Printf("站点密码保护已启用（会话有效期 %d 天）", sessionDays)
+			log.Printf("auth enabled (plaintext password, session %d days)", start.sessionDays)
 		}
 	}
-	if !authOn {
-		log.Printf("!!! 匿名访问模式（allow_anonymous=true）：任何人可读写全部笔记，切勿暴露到公网 !!!")
+	if !start.authOn {
+		log.Printf("!!! anonymous mode (allow_anonymous=true): anyone can read/write all notes, do NOT expose to the public internet !!!")
 	}
 
 	mux := http.NewServeMux()
-	// 静态文件：禁用目录索引（CWE-548），拒绝路径穿越
+	// 静态文件：禁用目录索引，拒绝路径穿越
 	mux.HandleFunc("GET /static/", func(w http.ResponseWriter, r *http.Request) {
 		p := path.Clean(strings.TrimPrefix(r.URL.Path, "/static/"))
 		if p == "." || strings.HasPrefix(p, "..") || strings.HasSuffix(r.URL.Path, "/") {
@@ -1341,27 +1381,60 @@ func main() {
 	mux.HandleFunc("GET /{slug}", pageHandler)
 
 	go janitor()
+	go configWatcher()
 
-	log.Printf("szNote 已启动: http://0.0.0.0:%s  配置=%s", port, configPath)
-	log.Printf("  数据目录=%s  默认有效期=%v  正文上限=%dMB  单文件上限=%dMB  笔记总上限=%dMB",
-		dataDir, ttl, maxNote>>20, maxFile>>20, maxNoteTotal>>20)
-	if rateKBPS > 0 {
-		log.Printf("  附件下载限速=%d KB/s（0 = 不限速）  文本预览上限=%dKB", rateKBPS, inlinePreviewKB)
+	log.Printf("szNote started: http://0.0.0.0:%s  config=%s", port, configPath)
+	log.Printf("  data dir=%s  default ttl=%v  note limit=%dMB  file limit=%dMB  per-note total=%dMB",
+		dataDir, start.ttl, start.maxNote>>20, start.maxFile>>20, start.maxNoteTotal>>20)
+	if start.rateKBPS > 0 {
+		log.Printf("  download throttle=%d KB/s per connection (0=off)  text preview limit=%dKB", start.rateKBPS, start.inlinePreviewKB)
 	} else {
-		log.Printf("  附件下载限速=关闭  文本预览上限=%dKB", inlinePreviewKB)
+		log.Printf("  download throttle=off  text preview limit=%dKB", start.inlinePreviewKB)
 	}
-	log.Printf("  全局限速=%.0f req/s/IP  可信反代=%d 条", rateRPS, len(trustedNets))
+	log.Printf("  global rate=%.0f req/s/IP  trusted proxies=%d  hot reload=on (port/data_dir need restart)", start.rateRPS, len(start.trustedNets))
 
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           securityHeaders(rateLimit(mux)),
-		ReadHeaderTimeout: 10 * time.Second,   // 防 Slowloris（CWE-400）
-		ReadTimeout:       10 * time.Minute,   // 覆盖大文件慢速上传
-		WriteTimeout:      0,                  // 大文件限速下载可能很慢，交给 IdleTimeout
+		ReadHeaderTimeout: 10 * time.Second, // 防 Slowloris
+		ReadTimeout:       10 * time.Minute, // 覆盖大文件慢速上传
+		WriteTimeout:      0,                // 大文件限速下载可能很慢，交给 IdleTimeout
 		IdleTimeout:       90 * time.Second,
 		MaxHeaderBytes:    16 << 10,
 	}
 	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
+	}
+}
+
+// configWatcher 每 3 秒检查一次 config.json 是否变化，变化则重新加载。
+// port / data_dir / 监听地址不可热加载（需重启）；其余参数即时生效。
+func configWatcher() {
+	var lastMod int64
+	var lastSize int64
+	if fi, err := os.Stat(configPath); err == nil {
+		lastMod, lastSize = fi.ModTime().UnixNano(), fi.Size()
+	}
+	for range time.Tick(3 * time.Second) {
+		fi, err := os.Stat(configPath)
+		if err != nil {
+			continue
+		}
+		m, s := fi.ModTime().UnixNano(), fi.Size()
+		if m == lastMod && s == lastSize {
+			continue
+		}
+		lastMod, lastSize = m, s
+
+		old := cfg()
+		if !loadConfig(false) { // 解析失败：保留旧配置，等下一次修改
+			continue
+		}
+		neu := cfg()
+		if old == neu {
+			continue
+		}
+		log.Printf("config reloaded: ttl=%v note=%dMB file=%dMB preview=%dKB throttle=%dKB/s rate=%.0frps auth=%v anon=%v (port/data_dir unchanged, restart to apply)",
+			neu.ttl, neu.maxNote>>20, neu.maxFile>>20, neu.inlinePreviewKB, neu.rateKBPS, neu.rateRPS, neu.authOn, neu.allowAnonymous)
 	}
 }

@@ -41,7 +41,10 @@
 <main id="editor" class="hidden">
   <header class="topbar">
     <a class="brand" href="/">📝 szNote</a>
-    <span id="status" class="muted"></span>
+    <span id="statusWrap">
+      <span id="modeTag" class="hidden"></span>
+      <span id="status" class="muted"></span>
+    </span>
     <div class="top-actions">
       <button id="btnPlain" title="切换纯文本模式：不解析 Markdown，日志与命令原样显示">Markdown</button>
       <select id="ttlSelect" title="无人访问保留时长：到期后笔记与附件自动删除">
@@ -62,7 +65,7 @@
   <!-- 纯文本模式提示条（仅在纯文本模式下显示） -->
   <div id="plainHint" class="hidden">
     <span class="ph-badge">纯文本</span>
-    <span class="ph-text">不解析 Markdown —— 内容原样显示，保留缩进、Tab 和换行，适合贴日志、命令与配置。</span>
+    <span class="ph-text">原样显示，不解析 Markdown。适合贴日志、命令、配置。</span>
     <button id="btnCopyAll" class="mini">复制全部</button>
     <button id="btnPlainOff" class="mini">切回 Markdown</button>
   </div>
@@ -70,8 +73,11 @@
   <div class="editor-body">
     <section id="panes">
       <textarea id="content" spellcheck="false" placeholder="在这里输入 Markdown…&#10;&#10;支持直接 Ctrl+V 粘贴截图，或把文件拖进来。"></textarea>
+      <div id="splitV" class="divider v" title="拖动调整宽度"></div>
       <div id="preview" class="markdown hidden"></div>
     </section>
+
+    <div id="splitH" class="divider h" title="拖动调整宽度"></div>
 
     <aside id="filesPanel">
       <h3>附件</h3>

@@ -94,7 +94,8 @@ make run                             # 构建并运行
 > 想内网免密使用，把它里面的 `security.allow_anonymous` 改为 `true` 即可。
 
 升级或重新部署时，先 `cp config.example.json config.json` 再改，避免漏掉新版本新增的字段。
-所有参数集中在 `config.json` 里，改完重启生效。
+所有参数集中在 `config.json` 里。**支持热加载**：保存后约 3 秒内生效（日志会输出 `config reloaded`）；
+`port` 和 `data_dir` 两项不支持热加载，改后需重启。
 Docker 部署时该文件以只读方式挂载进容器（`./config.json:/app/config.json`），**改配置不用重新构建镜像**。
 
 ```json
