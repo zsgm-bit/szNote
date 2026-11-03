@@ -1,6 +1,6 @@
-// SPDX-License-Identifier: AGPL-3.0-or-later
+// SPDX-License-Identifier: MIT
 // Copyright (c) 2026 szNote authors <https://github.com/zsgm-bit/szNote>
-// 双轨授权：AGPL-3.0（见 LICENSE）或商业许可（见 COMMERCIAL-LICENSE.md）。
+// 授权：MIT License（全文见 LICENSE）。
 
 package main
 
