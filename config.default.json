@@ -3,7 +3,8 @@
     "port": 9720,
     "password": "",
     "password_hash": "",
-    "session_days": 7
+    "session_days": 7,
+    "session_idle_minutes": 30
   },
   "storage": {
     "data_dir": "./data",

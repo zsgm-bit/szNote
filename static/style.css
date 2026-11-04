@@ -24,37 +24,81 @@ html, body {
 .hidden { display: none !important; }
 .muted { color: var(--muted); }
 
-/* ---------- 首页 ---------- */
-#home {
+/* ---------- 首页 / 登录：笔记本风格 ---------- */
+#home, #login {
   min-height: 100%;
   display: flex;
-  align-items: center;
+  align-items: flex-start;        /* 卡片靠上摆放，不再垂直居中 */
   justify-content: center;
-  padding: 24px;
+  padding: clamp(40px, 11vh, 120px) 24px 24px;
+  background: linear-gradient(180deg, #f4f2ed 0%, #ebe8e1 100%); /* 桌面质感底色 */
 }
 .home-card {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 12px;
-  padding: 40px 36px;
-  max-width: 460px;
+  position: relative;
+  background-color: #fffdf6;      /* 纸张底色 */
+  background-image: repeating-linear-gradient(to bottom,
+    transparent 0 27px, #efe8d7 27px 28px); /* 横线纸纹 */
+  border: 1px solid #e4ddcb;
+  border-radius: 4px 10px 10px 4px;
+  padding: 34px 36px 30px 64px;
+  max-width: 480px;
   width: 100%;
-  text-align: center;
-  box-shadow: 0 4px 24px rgba(0,0,0,.05);
+  text-align: left;
+  box-shadow: 0 16px 40px rgba(70, 58, 34, .13), 0 2px 8px rgba(70, 58, 34, .08);
 }
-.home-card h1 { margin: 0 0 8px; font-size: 26px; }
-.home-form { display: flex; gap: 8px; margin: 20px 0 12px; }
-#customSlug {
+/* 左侧装订孔 */
+.home-card::before {
+  content: "";
+  position: absolute;
+  top: 16px;
+  bottom: 16px;
+  left: 15px;
+  width: 16px;
+  background-image: radial-gradient(circle 4px at 8px 15px,
+    #ded7c3 2.2px, rgba(222, 215, 195, 0) 3px);
+  background-size: 16px 30px;
+  background-repeat: repeat-y;
+}
+/* 红色页边线（经典笔记本样式） */
+.home-card::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 44px;
+  width: 1.5px;
+  background: #e8b3b3;
+}
+.home-card h1 {
+  margin: 0 0 6px;
+  font-size: 28px;
+  letter-spacing: .5px;
+}
+.home-card .muted, .home-card .hint { line-height: 28px; } /* 文字落在横线上 */
+.home-form { display: flex; gap: 10px; margin: 20px 0 12px; }
+#customSlug, #loginPassword {
   flex: 1;
-  padding: 9px 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
+  min-width: 0;
+  padding: 6px 2px;
+  background: transparent;
+  border: none;
+  border-bottom: 1.5px dashed #cfc7b2;
+  border-radius: 0;
   font-size: 14px;
+  font-family: inherit;
+  color: var(--text);
   outline: none;
 }
-#customSlug:focus { border-color: var(--accent); }
+#customSlug::placeholder, #loginPassword::placeholder { color: #b4ad9a; }
+#customSlug:focus, #loginPassword:focus { border-bottom: 1.5px solid var(--accent); }
 .hint { font-size: 12px; margin-top: 16px; }
-.hint code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+.hint code { background: rgba(0, 0, 0, .05); padding: 1px 5px; border-radius: 4px; }
+.home-card button.ghost { margin-top: 4px; }
+@media (max-width: 520px) {
+  .home-card { padding: 28px 22px 24px 52px; }
+  .home-card::before { left: 8px; }
+  .home-card::after { left: 32px; }
+}
 
 /* ---------- 按钮 ---------- */
 button {

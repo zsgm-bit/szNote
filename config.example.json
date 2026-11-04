@@ -3,10 +3,12 @@
 
   "server": {
     "_密码说明": "二选一：password 填明文（简单，但密码会明文落盘）；password_hash 填 ./sznote -hash '你的密码' 的输出（推荐，优先于明文）。两者都为空 = 不启用鉴权，此时必须把 security.allow_anonymous 设为 true 才能启动。",
+    "_会话说明": "session_days=登录会话最长有效天数；session_idle_minutes=空闲超时（分钟）：超过该时长没有任何需登录的操作，会话自动吊销，页面会提示「登录已超时，请重新登录」。0=不启用空闲超时（仅受 session_days 约束）。",
     "port": 9720,
     "password": "",
     "password_hash": "",
-    "session_days": 7
+    "session_days": 7,
+    "session_idle_minutes": 30
   },
 
   "storage": {

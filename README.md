@@ -8,8 +8,8 @@
 
 ## 特性
 
-- **短链 / 自定义地址**：`http://<host>:9720/39gj29` 或 `/自定义名`（字母数字、`-`、`_`，最长 64）
-- **站点密码保护**：设置密码后，阅读 / 编辑 / 上传统一登录；密码支持明文或 PBKDF2 哈希（`sznote -hash` 生成，推荐）；会话存服务端（退出登录 / 重启即吊销），Cookie 带 `HttpOnly + SameSite=Strict`，HTTPS 下自动加 `Secure`；连续失败 5 次锁 IP 10 分钟
+- **短链 / 自定义地址**：`http://<host>:9720/39gj29` 或 `/自定义名`（字母数字、`-`、`_`，最短 1 位、最长 64 位）
+- **站点密码保护**：设置密码后，阅读 / 编辑 / 上传统一登录；密码支持明文或 PBKDF2 哈希（`sznote -hash` 生成，推荐）；会话存服务端（退出登录 / 重启即吊销），**空闲超时自动登出**（默认 30 分钟无操作即吊销，页面主动提示重新登录），Cookie 带 `HttpOnly + SameSite=Strict`，HTTPS 下自动加 `Secure`；连续失败 5 次锁 IP 10 分钟
 - **Markdown + 三态预览**：点「预览」＝分屏，再点＝全屏预览，再点回到编辑（`Ctrl+P` 同效）
 - **纯文本模式**：一键切到纯文本（每个笔记独立记忆），不解析 Markdown，日志里的 `#`、`*`、`_` 原样保留，附「复制全部」；排错贴日志 / 命令用这个
 - **图片粘贴 / 拖拽**：`Ctrl+V` 贴截图自动上传并插入引用；拖到编辑区插引用，拖到右侧附件栏只存不插
@@ -100,7 +100,7 @@ Docker 部署时该文件以只读方式挂载进容器（`./config.json:/app/co
 
 ```json
 {
-  "server":   { "port": 9720, "password": "", "password_hash": "", "session_days": 7 },
+  "server":   { "port": 9720, "password": "", "password_hash": "", "session_days": 7, "session_idle_minutes": 30 },
   "storage":  { "data_dir": "./data", "max_note_mb": 5, "max_file_mb": 50, "inline_preview_kb": 512, "max_note_total_mb": 200 },
   "policy":   { "default_ttl_hours": 24, "rate_kbps": 100 },
   "security": { "max_login_attempts": 5, "lock_minutes": 10, "trusted_proxies": ["127.0.0.1", "::1"], "rate_rps": 50, "allow_anonymous": false }
@@ -112,7 +112,8 @@ Docker 部署时该文件以只读方式挂载进容器（`./config.json:/app/co
 | `server.port` | `9720` | 监听端口（Docker 下对外端口请改 `docker-compose.yml` 的 `ports` 左侧） |
 | `server.password` | 空 | 站点访问密码（明文），阅读 / 编辑 / 上传统一使用 |
 | `server.password_hash` | 空 | 站点密码的 PBKDF2 哈希（推荐，见下方「密码哈希」），优先于明文 |
-| `server.session_days` | `7` | 登录会话有效天数（会话存服务端，退出即吊销） |
+| `server.session_days` | `7` | 登录会话最长有效天数（会话存服务端，退出即吊销） |
+| `server.session_idle_minutes` | `30` | 空闲超时（分钟）：超过该时长没有任何需登录的操作，会话自动吊销，页面提示「登录已超时，请重新登录」；`0` = 不启用 |
 | `storage.data_dir` | `./data` | 数据目录（容器内为 `/app/data`） |
 | `storage.max_note_mb` | `5` | 单条笔记正文上限 (MB) |
 | `storage.max_file_mb` | `50` | **单个附件大小上限 (MB)** |
@@ -169,6 +170,7 @@ data/notes/<地址>/
 | GET | `/api/health` | 健康检查（始终开放，返回是否启用密码、正文/附件上限） |
 | POST | `/api/login` | 登录，body `{"password":"..."}` |
 | POST | `/api/logout` | 退出登录 |
+| GET | `/api/session` | 会话探测（需登录；只读校验，不刷新空闲计时，供前端轮询弹回登录页） |
 | GET | `/api/{slug}` | 读取笔记 `{slug, exists, content, files[], ttl_hours, plain}` |
 | PUT | `/api/{slug}` | 保存，body `{"content":"...","ttl_hours":24,"plain":false}` |
 | POST | `/api/{slug}/upload` | multipart 上传，字段名 `file` |
@@ -235,7 +237,7 @@ docker run -d --name sznote -p 9720:9720 \
 
 ## 安全机制（v1.0.2 加固）
 
-- **鉴权与会话**：站点密码支持明文或 PBKDF2 哈希（`sznote -hash` 生成）；会话令牌带随机 nonce 且存于服务端会话表——**退出登录 / 重启进程即吊销**，被盗 Cookie 无法在登出后继续使用；Cookie 带 `HttpOnly + SameSite=Strict`，检测到 HTTPS（直连或反代 `X-Forwarded-Proto`）自动加 `Secure`。
+- **鉴权与会话**：站点密码支持明文或 PBKDF2 哈希（`sznote -hash` 生成）；会话令牌带随机 nonce 且存于服务端会话表——**退出登录 / 重启进程即吊销**，被盗 Cookie 无法在登出后继续使用；**空闲超时**（`session_idle_minutes`，默认 30 分钟）无操作即吊销会话，前端每 60 秒与页面切回前台时探测 `/api/session`，失效立即弹回登录页提示重新登录（探测端点不刷新空闲计时，不会自己把会话续下去）；Cookie 带 `HttpOnly + SameSite=Strict`，检测到 HTTPS（直连或反代 `X-Forwarded-Proto`）自动加 `Secure`。
 - **启动安全检查**：监听所有网卡但未设密码时拒绝启动，除非显式 `allow_anonymous: true`（仅限可信内网）。
 - **限速**：每 IP 全局令牌桶（`rate_rps`，默认 50 req/s）+ 登录失败锁定（支持 `trusted_proxies` 反代取真实 IP）。
 - **上传策略**：禁止 `.html/.htm/.svg/.hta/.php` 等主动内容格式；内容嗅探拒绝伪装成 `.dat` 的网页/SVG；单笔记总大小配额（`max_note_total_mb`）；上传内存阈值固定 8MB。

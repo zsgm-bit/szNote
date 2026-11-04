@@ -142,10 +142,10 @@ async function boot() {
     }
   } catch { /* 探测失败不阻塞，后续真实请求会再次校验 */ }
   if (needsLogin) {
-    $("login").classList.remove("hidden");
-    setupLogin();
+    showLoginScreen();
     return;
   }
+  if (h.auth) startSessionWatch();
   if (!slug) {
     $("home").classList.remove("hidden");
     setupHome();
@@ -157,6 +157,21 @@ async function boot() {
 boot();
 
 /* ---------- 登录 ---------- */
+
+/* 弹回登录页的统一入口：任何地方发现会话失效都走这里 */
+function showLoginScreen(msg) {
+  $("home").classList.add("hidden");
+  $("editor").classList.add("hidden");
+  $("login").classList.remove("hidden");
+  if (msg) {
+    const el = $("loginError");
+    el.textContent = msg;
+    el.style.display = "";
+  }
+  setupLogin();
+}
+
+let loginBound = false;
 
 function setupLogin() {
   const input = $("loginPassword");
@@ -188,7 +203,29 @@ function setupLogin() {
   };
 
   $("btnLogin").onclick = doLogin;
-  input.addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+  if (!loginBound) {          // 防止多次 setupLogin 重复绑定 Enter
+    loginBound = true;
+    input.addEventListener("keydown", (e) => { if (e.key === "Enter") doLogin(); });
+  }
+}
+
+/* ---------- 会话看门狗：空闲超时后主动弹回登录页 ----------
+ * 每 60 秒 + 页面切回前台时探测一次 /api/session（该端点只读校验，
+ * 不会刷新服务端的空闲计时，所以探测本身不会把会话续下去）。 */
+let watchStarted = false;
+
+function startSessionWatch() {
+  if (watchStarted) return;
+  watchStarted = true;
+  const probe = async () => {
+    if (document.hidden) return;          // 后台标签不探测，减少无谓请求
+    try {
+      const r = await fetch("/api/session");
+      if (r.status === 401) showLoginScreen("登录已超时，请重新登录");
+    } catch { /* 网络抖动忽略，下一个周期再查 */ }
+  };
+  setInterval(probe, 60000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) probe(); });
 }
 
 /* ---------- 首页 ---------- */
@@ -420,9 +457,7 @@ function copyLink() { copyText(location.origin + "/" + slug); }
 async function load() {
   const r = await fetch("/api/" + encodeURIComponent(slug));
   if (r.status === 401) {  // 会话过期 → 回到登录页
-    $("editor").classList.add("hidden");
-    $("login").classList.remove("hidden");
-    setupLogin();
+    showLoginScreen("登录已超时，请重新登录");
     return;
   }
   try {
@@ -456,10 +491,7 @@ async function save() {
       body: JSON.stringify({ content: $("content").value, ttl_hours: ttl, plain: plainMode }),
     });
     if (r.status === 401) {
-      setStatus("登录已过期");
-      $("editor").classList.add("hidden");
-      $("login").classList.remove("hidden");
-      setupLogin();
+      showLoginScreen("登录已超时，请重新登录");
       return;
     }
     if (!r.ok) {
@@ -533,6 +565,10 @@ async function uploadFile(file, isImage, insert = true) {
   fd.append("file", file);
   try {
     const r = await fetch("/api/" + encodeURIComponent(slug) + "/upload", { method: "POST", body: fd });
+    if (r.status === 401) {
+      showLoginScreen("登录已超时，请重新登录");
+      return;
+    }
     const d = await r.json();
     if (!r.ok) throw new Error(d.error || "上传失败");
     if (insert) {
@@ -609,7 +645,8 @@ function renderFiles(files) {
     del.title = "删除此附件";
     del.onclick = async () => {
       if (!confirm("删除附件 " + f.name + "？笔记正文中的引用会变成死链。")) return;
-      await fetch("/api/" + encodeURIComponent(slug) + "/file/" + encodeURIComponent(f.name), { method: "DELETE" });
+      const resp = await fetch("/api/" + encodeURIComponent(slug) + "/file/" + encodeURIComponent(f.name), { method: "DELETE" });
+      if (resp.status === 401) { showLoginScreen("登录已超时，请重新登录"); return; }
       refreshFiles();
     };
 

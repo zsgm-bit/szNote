@@ -40,12 +40,12 @@ import (
 var staticFS embed.FS
 
 const (
-	notesSub = "notes"                            // dataDir 下存放各笔记的子目录名
-	noteFile = "note.md"                          // 笔记正文文件名
-	metaFile = "meta.json"                        // 笔记元数据（自定义有效期）
-	filesDir = "files"                            // 每条笔记的附件目录名
-	alphabet = "abcdefghjkmnpqrstuvwxyz23456789"  // 随机短链字母表（去掉易混淆字符）
-	slugLen  = 10                                 // 随机地址长度（31 字符表 ≈ 49.5 bit 熵）
+	notesSub = "notes"                           // dataDir 下存放各笔记的子目录名
+	noteFile = "note.md"                         // 笔记正文文件名
+	metaFile = "meta.json"                       // 笔记元数据（自定义有效期）
+	filesDir = "files"                           // 每条笔记的附件目录名
+	alphabet = "abcdefghjkmnpqrstuvwxyz23456789" // 随机短链字母表（去掉易混淆字符）
+	slugLen  = 10                                // 随机地址长度（31 字符表 ≈ 49.5 bit 熵）
 
 	sessionCookie = "qn_session"
 
@@ -55,10 +55,11 @@ const (
 // fileConfig 对应 config.json 的结构。字段留空/省略时使用内置默认值。
 type fileConfig struct {
 	Server struct {
-		Port         flexInt `json:"port"` // 允许 9720 或 "9720" 两种写法
-		Password     string  `json:"password"`
-		PasswordHash string  `json:"password_hash"` // pbkdf2$iter$salt$hash（sznote -hash 生成），优先于明文
-		SessionDays  int     `json:"session_days"`
+		Port               flexInt `json:"port"` // 允许 9720 或 "9720" 两种写法
+		Password           string  `json:"password"`
+		PasswordHash       string  `json:"password_hash"` // pbkdf2$iter$salt$hash（sznote -hash 生成），优先于明文
+		SessionDays        int     `json:"session_days"`
+		SessionIdleMinutes int     `json:"session_idle_minutes"` // 空闲超时（分钟）：超时后会话吊销并提示重新登录，0=不启用
 	} `json:"server"`
 	Storage struct {
 		DataDir         string `json:"data_dir"`
@@ -74,9 +75,9 @@ type fileConfig struct {
 	Security struct {
 		MaxLoginAttempts int      `json:"max_login_attempts"`
 		LockMinutes      int      `json:"lock_minutes"`
-		TrustedProxies   []string `json:"trusted_proxies"`   // 可信反代 IP/CIDR，命中才解析 X-Forwarded-For
-		RateRPS          int      `json:"rate_rps"`          // 每 IP 全局请求速率上限（req/s），0=内置默认 50
-		AllowAnonymous   bool     `json:"allow_anonymous"`   // 显式接受"无密码匿名访问"风险
+		TrustedProxies   []string `json:"trusted_proxies"` // 可信反代 IP/CIDR，命中才解析 X-Forwarded-For
+		RateRPS          int      `json:"rate_rps"`        // 每 IP 全局请求速率上限（req/s），0=内置默认 50
+		AllowAnonymous   bool     `json:"allow_anonymous"` // 显式接受"无密码匿名访问"风险
 	} `json:"security"`
 }
 
@@ -101,21 +102,22 @@ var (
 	failMu sync.Mutex
 	failIP = map[string]*failState{}
 
-	// 服务端会话表：nonce -> 过期时间（支持退出即吊销）
+	// 服务端会话表：nonce -> 会话状态（支持退出即吊销 + 空闲超时自动登出）
 	sessMu     sync.Mutex
-	sessions   = map[string]int64{}
+	sessions   = map[string]*sessInfo{}
 	limMu      sync.Mutex
 	limitBucks = map[string]*limiter{}
 )
 
 // hotConfig 是可热加载的运行时配置集合。整体替换、整体读取，避免半新半旧。
 type hotConfig struct {
-	authOn       bool
-	sitePassword string // 明文密码，与 passwordHash 二选一
-	passwordHash string // PBKDF2 哈希，优先于明文
+	authOn         bool
+	sitePassword   string // 明文密码，与 passwordHash 二选一
+	passwordHash   string // PBKDF2 哈希，优先于明文
 	allowAnonymous bool
 
-	sessionDays int
+	sessionDays        int
+	sessionIdleMinutes int // 空闲超时（分钟），0=不启用；超时后会话吊销、前端弹回登录页
 
 	maxNote         int64         // 笔记正文上限
 	maxFile         int64         // 单附件上限
@@ -134,6 +136,12 @@ type hotConfig struct {
 
 // cfg 返回当前配置快照
 func cfg() *hotConfig { return hot.Load() }
+
+// sessInfo 单个会话的服务端状态：绝对过期 + 最近活跃（空闲超时判定用）
+type sessInfo struct {
+	exp  int64 // 绝对过期时间（Unix 秒），与会话令牌中的 exp 一致
+	last int64 // 最近一次通过鉴权的时间（Unix 秒）；空闲超时即吊销
+}
 
 // failState 单个 IP 的登录失败状态
 type failState struct {
@@ -169,6 +177,7 @@ func defaultConfig() fileConfig {
 	cfg := fileConfig{}
 	cfg.Server.Port = 9720
 	cfg.Server.SessionDays = 7
+	cfg.Server.SessionIdleMinutes = 30
 	cfg.Storage.DataDir = "./data"
 	cfg.Storage.MaxNoteMB = 5
 	cfg.Storage.MaxFileMB = 50
@@ -225,19 +234,20 @@ func loadConfig(initial bool) bool {
 	}
 
 	h := &hotConfig{
-		sitePassword:     fc.Server.Password,
-		passwordHash:     strings.TrimSpace(fc.Server.PasswordHash),
-		sessionDays:      fc.Server.SessionDays,
-		maxNote:          int64(fc.Storage.MaxNoteMB) << 20,
-		maxFile:          int64(fc.Storage.MaxFileMB) << 20,
-		maxNoteTotal:     int64(fc.Storage.MaxNoteTotalMB) << 20,
-		inlinePreviewKB:  fc.Storage.InlinePreviewKB,
-		ttl:              time.Duration(fc.Policy.DefaultTTLHours) * time.Hour,
-		rateKBPS:         fc.Policy.RateKBPS,
-		maxLoginAttempts: fc.Security.MaxLoginAttempts,
-		lockMinutes:      fc.Security.LockMinutes,
-		allowAnonymous:   fc.Security.AllowAnonymous,
-		rateRPS:          50,
+		sitePassword:       fc.Server.Password,
+		passwordHash:       strings.TrimSpace(fc.Server.PasswordHash),
+		sessionDays:        fc.Server.SessionDays,
+		sessionIdleMinutes: fc.Server.SessionIdleMinutes,
+		maxNote:            int64(fc.Storage.MaxNoteMB) << 20,
+		maxFile:            int64(fc.Storage.MaxFileMB) << 20,
+		maxNoteTotal:       int64(fc.Storage.MaxNoteTotalMB) << 20,
+		inlinePreviewKB:    fc.Storage.InlinePreviewKB,
+		ttl:                time.Duration(fc.Policy.DefaultTTLHours) * time.Hour,
+		rateKBPS:           fc.Policy.RateKBPS,
+		maxLoginAttempts:   fc.Security.MaxLoginAttempts,
+		lockMinutes:        fc.Security.LockMinutes,
+		allowAnonymous:     fc.Security.AllowAnonymous,
+		rateRPS:            50,
 	}
 	if fc.Security.RateRPS > 0 {
 		h.rateRPS = float64(fc.Security.RateRPS)
@@ -293,6 +303,9 @@ func loadConfig(initial bool) bool {
 	}
 	if h.sessionDays <= 0 {
 		h.sessionDays = 7
+	}
+	if h.sessionIdleMinutes < 0 {
+		h.sessionIdleMinutes = 30
 	}
 	if h.maxLoginAttempts <= 0 {
 		h.maxLoginAttempts = 5
@@ -703,7 +716,7 @@ func listFiles(slug string) []map[string]any {
 // 突发上限为 1 秒的量，避免完全卡死小文件。
 type rateReader struct {
 	r       io.Reader
-	rate    float64   // bytes/sec
+	rate    float64 // bytes/sec
 	allowed float64
 	last    time.Time
 }
@@ -958,12 +971,15 @@ func newSessionToken(d time.Duration) (string, error) {
 	fmt.Fprintf(mac, "%s|%d", nonce, exp)
 	token := fmt.Sprintf("%s.%x.%x", nonce, exp, mac.Sum(nil))
 	sessMu.Lock()
-	sessions[nonce] = exp
+	sessions[nonce] = &sessInfo{exp: exp, last: time.Now().Unix()}
 	sessMu.Unlock()
 	return token, nil
 }
 
-func validSession(r *http.Request) bool {
+// checkSession 校验会话令牌与服务端登记（只读，不刷新活跃时间）。
+// /api/session 探测端点用它：前端轮询不会把空闲计时清零，
+// 否则「超时弹回登录页」的看门狗自己就会把会话续下去。
+func checkSession(r *http.Request) bool {
 	c, err := r.Cookie(sessionCookie)
 	if err != nil {
 		return false
@@ -986,10 +1002,34 @@ func validSession(r *http.Request) bool {
 		return false
 	}
 	sessMu.Lock()
-	registered := sessions[parts[0]]
+	info := sessions[parts[0]]
+	ok := info != nil && info.exp == expiry
+	if ok {
+		// 空闲超时：超过 session_idle_minutes 无任何鉴权请求即吊销
+		if idle := int64(cfg().sessionIdleMinutes) * 60; idle > 0 &&
+			time.Now().Unix()-info.last > idle {
+			delete(sessions, parts[0])
+			ok = false
+		}
+	}
 	sessMu.Unlock()
 	// 会话必须存在于服务端表（退出/重启/清理后即吊销）
-	return registered == expiry
+	return ok
+}
+
+// validSession 校验通过后刷新活跃时间（滑动空闲窗口）
+func validSession(r *http.Request) bool {
+	c, err := r.Cookie(sessionCookie)
+	if err != nil || !checkSession(r) {
+		return false
+	}
+	nonce := strings.SplitN(c.Value, ".", 2)[0]
+	sessMu.Lock()
+	if info := sessions[nonce]; info != nil {
+		info.last = time.Now().Unix()
+	}
+	sessMu.Unlock()
+	return true
 }
 
 // requireAuth 包一层站点密码校验（未设密码时直接放行）
@@ -1147,7 +1187,6 @@ func exportZip(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-
 // ---------- 页面路由 ----------
 
 // GET / 与 GET /{slug} 都返回同一个前端页面（单页应用，由 JS 区分首页/编辑器）
@@ -1166,6 +1205,16 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(b)
+}
+
+// GET /api/session —— 前端会话探测（需登录）。
+// 只读校验、不刷新活跃时间，因此轮询它不会把空闲计时清零；
+// 前端以此实现「空闲超时 → 弹回登录页并提示重新登录」。
+func sessionProbe(w http.ResponseWriter, _ *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":           true,
+		"idle_minutes": cfg().sessionIdleMinutes,
+	})
 }
 
 // GET /api/health —— 健康检查（始终开放，auth 告诉前端是否需要登录）
@@ -1194,9 +1243,10 @@ func janitor() {
 // cleanupRuntime 老化内存状态：过期会话、闲置令牌桶、过期登录失败记录
 func cleanupRuntime() {
 	now := time.Now().Unix()
+	idle := int64(cfg().sessionIdleMinutes) * 60
 	sessMu.Lock()
-	for nonce, exp := range sessions {
-		if now > exp {
+	for nonce, v := range sessions {
+		if now > v.exp || (idle > 0 && now-v.last > idle) {
 			delete(sessions, nonce)
 		}
 	}
@@ -1354,6 +1404,13 @@ func main() {
 			log.Printf("auth enabled (plaintext password, session %d days)", start.sessionDays)
 		}
 	}
+	if start.authOn {
+		if start.sessionIdleMinutes > 0 {
+			log.Printf("  session idle timeout: %d min (re-login required after idle)", start.sessionIdleMinutes)
+		} else {
+			log.Printf("  session idle timeout: off")
+		}
+	}
 	if !start.authOn {
 		log.Printf("!!! anonymous mode (allow_anonymous=true): anyone can read/write all notes, do NOT expose to the public internet !!!")
 	}
@@ -1371,6 +1428,13 @@ func main() {
 	mux.HandleFunc("GET /api/health", health)
 	mux.HandleFunc("POST /api/login", login)
 	mux.HandleFunc("POST /api/logout", logout)
+	mux.HandleFunc("GET /api/session", func(w http.ResponseWriter, r *http.Request) {
+		if cfg().authOn && !checkSession(r) {
+			fail(w, http.StatusUnauthorized, "需要访问密码")
+			return
+		}
+		sessionProbe(w, r)
+	})
 	mux.HandleFunc("GET /api/{slug}", requireAuth(getNote))
 	mux.HandleFunc("PUT /api/{slug}", requireAuth(saveNote))
 	mux.HandleFunc("POST /api/{slug}/upload", requireAuth(upload))
