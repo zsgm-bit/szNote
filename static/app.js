@@ -14,6 +14,7 @@ let dirty = false;
 let previewMode = 0; // 0=仅编辑 1=分屏 2=全屏预览
 let plainMode = false; // 纯文本模式：不解析 Markdown
 let MAX_NOTE_MB = 5; // 由 /api/health 下发，仅用于报错提示
+let HEALTH = {}; // /api/health 结果：transfer 配置等，boot 时填充
 let saveTimer = null;
 let renderTimer = null;
 
@@ -134,8 +135,9 @@ async function boot() {
   let needsLogin = false;
   try {
     const h = await (await fetch("/api/health")).json();
-    if (h.max_note_mb) MAX_NOTE_MB = h.max_note_mb;
-    if (h.auth) {
+    HEALTH = h || {};
+    if (HEALTH.max_note_mb) MAX_NOTE_MB = HEALTH.max_note_mb;
+    if (HEALTH.auth) {
       // 站点密码已启用：探测会话是否有效（未登录时受保护 API 返回 401）
       const probe = await fetch("/api/" + (slug || "__ping"));
       needsLogin = probe.status === 401;
@@ -145,7 +147,7 @@ async function boot() {
     showLoginScreen();
     return;
   }
-  if (h.auth) startSessionWatch();
+  if (HEALTH.auth) startSessionWatch();
   if (!slug) {
     $("home").classList.remove("hidden");
     setupHome();
@@ -251,8 +253,8 @@ function setupHome() {
   const go = (s) => {
     s = (s || "").trim();
     if (!s) { toast("请输入自定义地址，或点「随机一个笔记」"); return; }
-    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(s)) {
-      toast("地址仅允许字母、数字、- 和 _，最长 64 字符");
+    if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]{5,63}$/.test(s)) {
+      toast("地址仅允许字母、数字、- 和 _，长度 6~64 字符");
       return;
     }
     location.href = "/" + s;
@@ -268,9 +270,7 @@ function setupEditor() {
   const ta = $("content");
   document.title = "/" + slug + " · szNote";
 
-  $("btnCopyLink").onclick = copyLink;
-  $("btnSave").onclick = save;
-  $("btnPreview").onclick = togglePreview;
+  $("modeTag").onclick = togglePreview; // 顶栏中间的模式指示兼作预览切换按钮
   $("btnPlain").onclick = () => setPlain(!plainMode, true);
   $("btnPlainOff").onclick = () => setPlain(false, true);
   $("btnCopyAll").onclick = () => copyText($("content").value);
@@ -383,6 +383,7 @@ function setupEditor() {
 
   setupSplitters();
   applySavedWidths();
+  setupSwap();
 
   /* 宽屏默认分屏：粘贴图片/文字当场就能看到效果 */
   setPreviewMode(window.innerWidth > 860 ? 1 : 0);
@@ -451,8 +452,6 @@ function applySavedWidths() {
 function updateFilesMini(w) {
   $("filesPanel").classList.toggle("mini", w < 88);
 }
-
-function copyLink() { copyText(location.origin + "/" + slug); }
 
 async function load() {
   const r = await fetch("/api/" + encodeURIComponent(slug));
@@ -528,12 +527,10 @@ function setPreviewMode(mode) {
   $("preview").classList.toggle("hidden", mode === 0);
   panes.classList.toggle("previewing", mode > 0);
   panes.classList.toggle("fullpreview", mode === 2);
-  const btn = $("btnPreview");
-  btn.textContent = mode === 2 ? "全屏" : mode === 1 ? "分屏" : "预览";
-  btn.title = mode === 2 ? "返回编辑 (Ctrl+P)" : "预览：点一下分屏，再点一下全屏 (Ctrl+P)";
-  /* 顶栏中间的模式指示，颜色随状态变化 */
+  /* 顶栏中间的模式指示（兼作切换按钮），颜色随状态变化 */
   const tag = $("modeTag");
-  tag.classList.toggle("hidden", false);
+  tag.title = mode === 2 ? "返回编辑 (Ctrl+P)" : "预览：点一下分屏，再点一下全屏 (Ctrl+P)";
+  tag.classList.remove("hidden");
   tag.classList.remove("mode-edit", "mode-split", "mode-preview");
   if (mode === 0) { tag.textContent = "编辑"; tag.classList.add("mode-edit"); }
   else if (mode === 1) { tag.textContent = "分屏"; tag.classList.add("mode-split"); }
@@ -652,5 +649,289 @@ function renderFiles(files) {
 
     li.append(idx, thumb, name, size, dl, del);
     ul.appendChild(li);
+  }
+}
+
+/* ---------- 文件互传（服务器中转） ---------- */
+
+/* 弹窗开关 / 标签页 */
+function setupSwap() {
+  const T = HEALTH.transfer || {};
+  if (T.enabled === false) { // 配置里关掉了：隐藏入口
+    $("btnSwap").classList.add("hidden");
+    return;
+  }
+  if (Array.isArray(T.exts) && T.exts.length) {
+    $("swapFile").accept = T.exts.join(",");
+    const parts = ["允许的类型：" + T.exts.join(" ")];
+    if (T.max_file_mb) parts.push("单文件上限 " + T.max_file_mb + " MB");
+    if (T.up_kbps) parts.push("上传限速 " + T.up_kbps + " KB/s");
+    if (T.down_kbps) parts.push("下载限速 " + T.down_kbps + " KB/s");
+    $("sendHint").textContent = parts.join(" · ");
+  }
+
+  $("btnSwap").onclick = () => { $("swapMask").classList.remove("hidden"); loadRecvList(); };
+  $("swapClose").onclick = () => $("swapMask").classList.add("hidden");
+  $("swapMask").addEventListener("click", (e) => {
+    if (e.target === $("swapMask")) $("swapMask").classList.add("hidden");
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("swapMask").classList.contains("hidden")) {
+      $("swapMask").classList.add("hidden");
+    }
+  });
+
+  const setTab = (send) => {
+    $("tabSend").classList.toggle("active", send);
+    $("tabRecv").classList.toggle("active", !send);
+    $("paneSend").classList.toggle("hidden", !send);
+    $("paneRecv").classList.toggle("hidden", send);
+    if (!send) loadRecvList();
+  };
+  $("tabSend").onclick = () => setTab(true);
+  $("tabRecv").onclick = () => setTab(false);
+
+  $("btnPickFile").onclick = () => $("swapFile").click();
+  $("swapFile").addEventListener("change", (e) => {
+    const f = e.target.files[0];
+    e.target.value = "";
+    if (f) startSend(f);
+  });
+  $("btnCopyCode").onclick = () => copyText($("sendCode").textContent);
+  $("btnQueryCode").onclick = queryCode;
+  $("swapCode").addEventListener("keydown", (e) => { if (e.key === "Enter") queryCode(); });
+}
+
+function randomHex(nBytes) {
+  const b = new Uint8Array(nBytes);
+  crypto.getRandomValues(b);
+  return Array.from(b, (v) => v.toString(16).padStart(2, "0")).join("");
+}
+
+async function postJSON(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || "http " + r.status);
+  return d;
+}
+
+function fmtEta(sec) {
+  if (!isFinite(sec) || sec < 0) return "--";
+  sec = Math.ceil(sec);
+  if (sec >= 3600) return Math.floor(sec / 3600) + "h" + Math.ceil((sec % 3600) / 60) + "m";
+  if (sec >= 60) return Math.floor(sec / 60) + "m" + (sec % 60) + "s";
+  return sec + "s";
+}
+
+/* 速度估计：按已传输字节的时间序列做 EMA 平滑，进度条不抖 */
+function speedTracker() {
+  let lastBytes = null, lastT = 0, ema = 0;
+  return (bytes) => {
+    const now = Date.now();
+    if (lastBytes !== null && now > lastT && bytes >= lastBytes) {
+      const inst = (bytes - lastBytes) / ((now - lastT) / 1000);
+      ema = ema ? ema * 0.7 + inst * 0.3 : inst;
+    }
+    lastBytes = bytes;
+    lastT = now;
+    return ema;
+  };
+}
+
+function setProgress(bar, statEl, got, total, speed) {
+  const pct = total > 0 ? Math.min(100, (got / total) * 100) : 0;
+  bar.style.width = pct.toFixed(1) + "%";
+  const parts = [fmtSize(got) + " / " + fmtSize(total), pct.toFixed(1) + "%"];
+  if (speed > 0) {
+    parts.push((speed / 1024).toFixed(1) + " KB/s");
+    parts.push("剩余 " + fmtEta((total - got) / speed));
+  }
+  statEl.textContent = parts.join(" · ");
+}
+
+/* 发送：分块上传，断线自动重试并按服务端进度续传；
+   同一文件（名字+大小+修改时间一致）跨刷新也能续传（令牌存 localStorage） */
+async function startSend(file) {
+  const T = HEALTH.transfer || {};
+  const ext = ("." + (file.name.split(".").pop() || "")).toLowerCase();
+  if (Array.isArray(T.exts) && T.exts.length && !T.exts.includes(ext)) {
+    toast("仅允许发送：" + T.exts.join(" "));
+    return;
+  }
+  if (T.max_file_mb && file.size > T.max_file_mb * 1048576) {
+    toast("文件超过 " + T.max_file_mb + " MB 上限");
+    return;
+  }
+  let prev = null;
+  try { prev = JSON.parse(localStorage.getItem("szn.tr.resume") || "null"); } catch {}
+  const same = prev && prev.name === file.name && prev.size === file.size && prev.mtime === file.lastModified;
+  const token = (same && prev.token) || randomHex(32);
+
+  $("sendIdle").classList.add("hidden");
+  $("sendDone").classList.add("hidden");
+  $("sendBusy").classList.remove("hidden");
+  $("sendName").textContent = file.name;
+  const bar = $("sendBar"), stat = $("sendStat");
+  const speed = speedTracker();
+  const setProg = (got) => setProgress(bar, stat, got, file.size, speed(got));
+
+  try {
+    let init = await postJSON("/api/transfer/init", { name: file.name, size: file.size, token });
+    const code = init.code;
+    const CHUNK = init.chunk || 262144;
+    localStorage.setItem("szn.tr.resume",
+      JSON.stringify({ token, name: file.name, size: file.size, mtime: file.lastModified }));
+    let offset = init.offset || 0;
+    setProg(offset);
+    let fails = 0;
+    while (offset < file.size) {
+      const end = Math.min(offset + CHUNK, file.size);
+      try {
+        const r = await fetch(`/api/transfer/${code}/chunk?offset=${offset}`, {
+          method: "PUT",
+          body: file.slice(offset, end),
+        });
+        if (r.status === 401) { showLoginScreen("登录已超时，请重新登录"); return; }
+        const d = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(d.error || "http " + r.status);
+        offset = typeof d.offset === "number" ? d.offset : end;
+        fails = 0;
+      } catch (err) {
+        fails++;
+        if (fails >= 5) throw err;
+        await new Promise((res) => setTimeout(res, 1200 * fails));
+        // 网络恢复后先向服务端核实真实进度，再从那里继续
+        try {
+          const re = await postJSON("/api/transfer/init", { name: file.name, size: file.size, token });
+          if (re.code === code && typeof re.offset === "number") offset = re.offset;
+        } catch { /* 下一轮重试再同步 */ }
+      }
+      setProg(offset);
+    }
+    await postJSON(`/api/transfer/${code}/complete`, {});
+    localStorage.removeItem("szn.tr.resume");
+    $("sendBusy").classList.add("hidden");
+    $("sendDone").classList.remove("hidden");
+    $("sendCode").textContent = code;
+    $("sendExpires").textContent = "接收方可在「接收文件」列表里直接看到该文件；到期后服务器自动清理。";
+  } catch (err) {
+    $("sendBusy").classList.add("hidden");
+    $("sendIdle").classList.remove("hidden");
+    toast("发送中断：" + (err.message || "网络错误") + "（进度已保留，重选同一文件可续传）");
+  }
+}
+
+/* 接收：待取列表 + 取件码查询 */
+async function loadRecvList() {
+  const ul = $("recvList");
+  ul.innerHTML = "";
+  try {
+    const r = await fetch("/api/transfer");
+    if (r.status === 401) { showLoginScreen("登录已超时，请重新登录"); return; }
+    const d = await r.json();
+    const items = d.items || [];
+    $("recvEmpty").style.display = items.length ? "none" : "";
+    for (const it of items) {
+      const li = document.createElement("li");
+      li.className = "recv-item";
+      const info = document.createElement("span");
+      info.className = "recv-info";
+      info.textContent = it.name + "（" + fmtSize(it.size) + "）";
+      info.title = "取件码 " + it.code;
+      const dl = document.createElement("button");
+      dl.className = "mini primary";
+      dl.textContent = "下载";
+      dl.onclick = () => downloadTransfer(it.code, it.name, it.size);
+      const del = document.createElement("button");
+      del.className = "mini";
+      del.textContent = "撤回";
+      del.title = "删除该中转文件，接收方将无法再下载";
+      del.onclick = async () => {
+        if (!confirm("撤回 " + it.name + "？")) return;
+        await fetch("/api/transfer/" + encodeURIComponent(it.code), { method: "DELETE" });
+        loadRecvList();
+      };
+      li.append(info, dl, del);
+      ul.appendChild(li);
+    }
+  } catch { /* 列表拉取失败不打扰用户 */ }
+}
+
+async function queryCode() {
+  const code = $("swapCode").value.trim();
+  if (!code) { toast("请输入取件码"); return; }
+  try {
+    const r = await fetch("/api/transfer/info?code=" + encodeURIComponent(code));
+    if (r.status === 401) { showLoginScreen("登录已超时，请重新登录"); return; }
+    const d = await r.json();
+    if (!r.ok) { toast(d.error || "取件码不存在"); return; }
+    if (!d.ready) { toast("该文件尚未发送完成"); return; }
+    downloadTransfer(d.code, d.name, d.size);
+  } catch {
+    toast("查询失败，请重试");
+  }
+}
+
+/* 下载：ReadableStream 逐块计数展示进度；中断后用 Range 从已收字节续传 */
+async function downloadTransfer(code, name, size) {
+  $("recvBusy").classList.remove("hidden");
+  $("recvName").textContent = name;
+  const bar = $("recvBar"), stat = $("recvStat");
+  const speed = speedTracker();
+  const setProg = (got) => setProgress(bar, stat, got, size, speed(got));
+  let got = 0;
+  const parts = [];
+  try {
+    for (let attempt = 0;;) {
+      let r;
+      try {
+        r = await fetch("/api/transfer/download?code=" + encodeURIComponent(code),
+          got > 0 ? { headers: { Range: "bytes=" + got + "-" } } : {});
+      } catch (netErr) {
+        throw netErr;
+      }
+      if (r.status === 401) { showLoginScreen("登录已超时，请重新登录"); return; }
+      if (!r.ok && r.status !== 206) {
+        const d = await r.json().catch(() => ({}));
+        throw new Error(d.error || "http " + r.status);
+      }
+      if (attempt === 0) {
+        // 从 Content-Disposition 解析真实文件名（取件码查询场景）
+        const cd = r.headers.get("Content-Disposition") || "";
+        const m = cd.match(/filename\*=UTF-8''([^;]+)/i);
+        if (m) { try { name = decodeURIComponent(m[1]); } catch { /* 保持原名 */ } }
+        else if ((m = cd.match(/filename="([^"]+)"/))) name = m[1];
+        $("recvName").textContent = name;
+        const cl = parseInt(r.headers.get("Content-Length"), 10);
+        if (cl > 0) size = got + cl;
+      } else if (r.status === 200 && got > 0) {
+        parts.length = 0; got = 0; // 服务端未续传：从头收
+      }
+      const reader = r.body.getReader();
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        parts.push(value);
+        got += value.length;
+        setProg(got);
+      }
+      break;
+    }
+    const blob = new Blob(parts);
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+    toast("下载完成：" + name);
+  } catch (err) {
+    toast("下载中断：" + (err.message || "网络错误") + "（已收 " + fmtSize(got) + "，重新下载可续传）");
+  } finally {
+    $("recvBusy").classList.add("hidden");
+    loadRecvList();
   }
 }

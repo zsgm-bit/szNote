@@ -15,9 +15,21 @@
     "_说明": "max_note_mb=单条笔记正文上限；max_file_mb=单个附件上限；inline_preview_kb=文本附件在线预览上限，超出改下载；max_note_total_mb=单笔记正文+附件总量上限，0=不限制。",
     "data_dir": "./data",
     "max_note_mb": 5,
-    "max_file_mb": 50,
+    "max_file_mb": 10,
     "inline_preview_kb": 512,
     "max_note_total_mb": 200
+  },
+
+  "transfer": {
+    "_说明": "文件互传（服务器纯中转）：同站登录用户之间点对点传文件，服务器只搬运字节、不解压不校验内容。到期或长时间未完成会自动清理。up_kbps/down_kbps 是整个服务器的全局上行/下行限速（KB/s），0=不限速；所有参数均支持热加载。",
+    "_白名单说明": "ext_whitelist 按扩展名放行（服务器另外校验 PK 魔数，非压缩包内容会被拒）。想放开其他类型就往数组里加，如 [\".zip\", \".7z\", \".tar.gz\"]。",
+    "enabled": true,
+    "max_file_mb": 50,
+    "up_kbps": 100,
+    "down_kbps": 100,
+    "expire_hours": 24,
+    "max_storage_mb": 500,
+    "ext_whitelist": [".zip"]
   },
 
   "policy": {

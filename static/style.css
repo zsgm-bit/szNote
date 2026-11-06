@@ -102,7 +102,31 @@ button.ghost { background: transparent; }
   flex-wrap: wrap;
 }
 .brand { color: var(--text); font-weight: 600; text-decoration: none; font-size: 15px; flex-shrink: 0; }
-.top-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.top-actions { margin-left: auto; display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+/* 右侧按钮：更大的呼吸感 + 更柔和的配色 */
+.top-actions button, .top-actions select {
+  padding: 8px 16px;
+  border-color: #d9dfe6;
+  border-radius: 8px;
+  background: var(--panel);
+}
+.top-actions button:hover {
+  background: #f2f6ff;
+  border-color: #9db9f0;
+  color: var(--accent);
+}
+/* 退出：与左侧操作按钮拉开距离 + 细分隔线，避免误点 */
+#btnLogout { margin-left: 14px; position: relative; }
+#btnLogout::before {
+  content: "";
+  position: absolute;
+  left: -14px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
+  height: 16px;
+  background: var(--line);
+}
 /* 状态提示：顶栏正中间（模式指示 + 保存状态） */
 #statusWrap {
   position: absolute;
@@ -114,11 +138,18 @@ button.ghost { background: transparent; }
   gap: 12px;
   font-size: 12px;
   white-space: nowrap;
-  pointer-events: none;
+  pointer-events: none; /* 容器不挡下方点击；内部按钮单独恢复 */
 }
+#modeTag, #btnPlain { pointer-events: auto; }
 #status { color: var(--muted); }
-/* 模式指示：不同页面状态用不同颜色 */
-#modeTag { font-weight: 600; letter-spacing: 1px; }
+/* 模式指示（兼作预览切换按钮）：不同页面状态用不同颜色 */
+#modeTag {
+  font-weight: 600;
+  letter-spacing: 1px;
+  padding: 6px 14px;
+  border-radius: var(--radius);
+}
+#modeTag:hover { border-color: var(--accent); }
 #modeTag.mode-edit { color: var(--muted); }
 #modeTag.mode-split { color: var(--accent); }
 #modeTag.mode-preview { color: var(--danger); }
@@ -245,7 +276,16 @@ button.ghost { background: transparent; }
   flex-shrink: 0;
 }
 #filesPanel.dragging { outline: 2px dashed var(--accent); outline-offset: -4px; }
-#filesPanel h3 { margin: 0 0 10px; font-size: 13px; color: var(--muted); }
+#filesPanel h3 {
+  margin: 0 0 10px;
+  font-size: 13px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+#filesPanel h3 button.mini { padding: 2px 9px; font-size: 12px; }
 #fileList { list-style: none; margin: 0; padding: 0; }
 #fileList li {
   display: flex;
@@ -257,6 +297,7 @@ button.ghost { background: transparent; }
 .fidx { display: none; font-size: 12px; color: var(--muted); flex-shrink: 0; min-width: 20px; }
 #filesPanel.mini { padding: 10px 6px; }
 #filesPanel.mini h3 { font-size: 12px; margin-bottom: 6px; }
+#filesPanel.mini h3 button.mini { display: none; }
 #filesPanel.mini .fidx { display: inline; }
 #filesPanel.mini .fname,
 #filesPanel.mini .fsize,

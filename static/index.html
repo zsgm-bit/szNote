@@ -33,7 +33,7 @@
       <button id="btnOpen" class="primary">打开 / 创建</button>
     </div>
     <button id="btnRandom" class="ghost">🎲 随机一个笔记</button>
-    <p class="hint muted">地址仅允许字母、数字、<code>-</code>、<code>_</code>；任何知道地址的人都能查看和编辑。</p>
+    <p class="hint muted">地址仅允许字母、数字、<code>-</code>、<code>_</code>，长度 6–64 位；任何知道地址的人都能查看和编辑。</p>
   </div>
 </main>
 
@@ -42,22 +42,19 @@
   <header class="topbar">
     <a class="brand" href="/">📝 szNote</a>
     <span id="statusWrap">
-      <span id="modeTag" class="hidden"></span>
+      <button id="btnPlain" title="切换纯文本模式：不解析 Markdown，日志与命令原样显示">Markdown</button>
+      <button id="modeTag" class="hidden" title="预览"></button>
       <span id="status" class="muted"></span>
     </span>
     <div class="top-actions">
-      <button id="btnPlain" title="切换纯文本模式：不解析 Markdown，日志与命令原样显示">Markdown</button>
+      <button id="btnSwap" title="文件互传：发送 / 接收（服务器中转）">文件互传</button>
       <select id="ttlSelect" title="无人访问保留时长：到期后笔记与附件自动删除">
         <option value="24" selected title="1 天无人访问后删除">1 天</option>
         <option value="72" title="3 天无人访问后删除">3 天</option>
         <option value="120" title="5 天无人访问后删除">5 天</option>
         <option value="168" title="7 天无人访问后删除">7 天</option>
       </select>
-      <button id="btnExport" title="打包下载正文和附件">导出zip</button>
-      <button id="btnCopyLink" title="复制笔记链接">链接</button>
-      <button id="btnUpload" title="上传文件">上传</button>
-      <button id="btnPreview" title="切换预览 (Ctrl+P)">预览</button>
-      <button id="btnSave" class="primary" title="保存 (Ctrl+S)">保存</button>
+      <button id="btnExport" title="打包下载正文和附件">导出笔记</button>
       <button id="btnLogout" class="ghost" title="退出登录">退出</button>
     </div>
   </header>
@@ -80,7 +77,7 @@
     <div id="splitH" class="divider h" title="拖动调整宽度"></div>
 
     <aside id="filesPanel">
-      <h3>附件</h3>
+      <h3>附件 <button id="btnUpload" class="mini" title="上传附件（也可直接把文件拖进来）">＋ 上传附件</button></h3>
       <ul id="fileList"></ul>
       <p id="filesEmpty" class="muted">暂无附件。粘贴图片、上传文件或直接把文件拖到这里。</p>
     </aside>
@@ -88,6 +85,55 @@
 
   <input id="fileInput" type="file" multiple hidden>
 </main>
+
+<!-- ========== 文件互传弹窗 ========== -->
+<div id="swapMask" class="modal-mask hidden">
+  <div class="modal">
+    <div class="modal-head">
+      <h3>文件互传</h3>
+      <button id="swapClose" class="mini" title="关闭">✕</button>
+    </div>
+    <div class="swap-tabs">
+      <button id="tabSend" class="active">发送文件</button>
+      <button id="tabRecv">接收文件</button>
+    </div>
+
+    <!-- 发送 -->
+    <div id="paneSend">
+      <input id="swapFile" type="file" hidden>
+      <div id="sendIdle">
+        <button id="btnPickFile" class="primary">选择文件…</button>
+        <p id="sendHint" class="hint muted"></p>
+      </div>
+      <div id="sendBusy" class="hidden">
+        <p id="sendName" class="send-name"></p>
+        <div class="prog"><div class="prog-bar" id="sendBar"></div></div>
+        <p id="sendStat" class="stat mono muted"></p>
+      </div>
+      <div id="sendDone" class="hidden">
+        <p class="muted">发送完成！把取件码告诉接收方：</p>
+        <p class="code-row"><code id="sendCode"></code>
+          <button id="btnCopyCode" class="mini">复制</button></p>
+        <p id="sendExpires" class="hint muted"></p>
+      </div>
+    </div>
+
+    <!-- 接收 -->
+    <div id="paneRecv" class="hidden">
+      <div class="recv-row">
+        <input id="swapCode" type="text" maxlength="16" placeholder="输入取件码" autocomplete="off">
+        <button id="btnQueryCode" class="primary">查询</button>
+      </div>
+      <ul id="recvList"></ul>
+      <div id="recvBusy" class="hidden">
+        <p id="recvName" class="send-name"></p>
+        <div class="prog"><div class="prog-bar" id="recvBar"></div></div>
+        <p id="recvStat" class="stat mono muted"></p>
+      </div>
+      <p id="recvEmpty" class="hint muted">暂无待接收的文件。</p>
+    </div>
+  </div>
+</div>
 
 <div id="toast"></div>
 

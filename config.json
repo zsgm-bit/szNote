@@ -9,9 +9,18 @@
   "storage": {
     "data_dir": "./data",
     "max_note_mb": 5,
-    "max_file_mb": 50,
+    "max_file_mb": 10,
     "inline_preview_kb": 512,
     "max_note_total_mb": 200
+  },
+  "transfer": {
+    "enabled": true,
+    "max_file_mb": 50,
+    "up_kbps": 100,
+    "down_kbps": 100,
+    "expire_hours": 24,
+    "max_storage_mb": 500,
+    "ext_whitelist": [".zip"]
   },
   "policy": {
     "default_ttl_hours": 24,
