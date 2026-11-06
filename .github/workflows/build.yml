@@ -44,36 +44,36 @@ jobs:
           curl -sf http://127.0.0.1:9720/api/health
           echo
           echo "--- 未登录应 401"
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9720/api/ci)" = "401"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9720/api/ci-note)" = "401"
           echo "--- 登录"
           curl -sf -c /tmp/ck.txt -X POST http://127.0.0.1:9720/api/login \
             -H 'Content-Type: application/json' -d '{"password":"ci-pass"}'
           echo
           echo "--- 保存/读取"
-          curl -sf -b /tmp/ck.txt -X PUT http://127.0.0.1:9720/api/ci \
+          curl -sf -b /tmp/ck.txt -X PUT http://127.0.0.1:9720/api/ci-note \
             -H 'Content-Type: application/json' -d '{"content":"# ci\n```sh\necho hi\n```","ttl_hours":24}'
-          curl -sf -b /tmp/ck.txt http://127.0.0.1:9720/api/ci | grep -q '"exists":true'
+          curl -sf -b /tmp/ck.txt http://127.0.0.1:9720/api/ci-note | grep -q '"exists":true'
           echo "--- 上传/导出"
           printf 'hello' > /tmp/a.txt
-          curl -sf -b /tmp/ck.txt -F "file=@/tmp/a.txt" http://127.0.0.1:9720/api/ci/upload > /dev/null
-          curl -sf -b /tmp/ck.txt -o /tmp/e.zip http://127.0.0.1:9720/api/ci/export
+          curl -sf -b /tmp/ck.txt -F "file=@/tmp/a.txt" http://127.0.0.1:9720/api/ci-note/upload > /dev/null
+          curl -sf -b /tmp/ck.txt -o /tmp/e.zip http://127.0.0.1:9720/api/ci-note/export
           unzip -l /tmp/e.zip | grep -q 'files/a.txt'
           echo "--- 文本附件内嵌预览"
-          curl -sf -D /tmp/h.txt -o /dev/null -b /tmp/ck.txt http://127.0.0.1:9720/f/ci/a.txt
+          curl -sf -D /tmp/h.txt -o /dev/null -b /tmp/ck.txt http://127.0.0.1:9720/f/ci-note/a.txt
           grep -qi '^content-disposition: inline' /tmp/h.txt
           grep -qi '^content-type: text/plain' /tmp/h.txt
           echo "--- 纯文本模式往返"
-          curl -sf -b /tmp/ck.txt -X PUT http://127.0.0.1:9720/api/ci \
+          curl -sf -b /tmp/ck.txt -X PUT http://127.0.0.1:9720/api/ci-note \
             -H 'Content-Type: application/json' -d '{"content":"# 不是标题","plain":true}'
-          curl -sf -b /tmp/ck.txt http://127.0.0.1:9720/api/ci | grep -q '"plain":true'
+          curl -sf -b /tmp/ck.txt http://127.0.0.1:9720/api/ci-note | grep -q '"plain":true'
           echo "--- 非法有效期应 400"
           test "$(curl -s -o /dev/null -w '%{http_code}' -b /tmp/ck.txt -X PUT \
-            http://127.0.0.1:9720/api/ci -H 'Content-Type: application/json' \
+            http://127.0.0.1:9720/api/ci-note -H 'Content-Type: application/json' \
             -d '{"content":"x","ttl_hours":720}')" = "400"
           echo "--- 超过正文上限应 413"
           { printf '{"content":"'; head -c 6000000 /dev/zero | tr '\0' 'a'; printf '"}'; } > /tmp/big.json
           test "$(curl -s -o /dev/null -w '%{http_code}' -b /tmp/ck.txt -X PUT \
-            http://127.0.0.1:9720/api/big -H 'Content-Type: application/json' \
+            http://127.0.0.1:9720/api/big-note -H 'Content-Type: application/json' \
             --data-binary @/tmp/big.json)" = "413"
           echo "SMOKE OK"
 
