@@ -298,10 +298,3 @@ docker run -d --name sznote -p 9720:9720 \
 | 用于专利相关用途 | 无 |
 
 **唯一义务**：在所有副本或实质性部分中保留原始版权声明与本许可声明（即随附 `LICENSE` 文件）。
-
-> 软件按「原样」提供，不附带任何明示或默示担保；作者不对使用后果承担责任。
-
-> 版本说明：`v1.0.0` 沿用旧的 szNote License v1.0，`v1.0.1`–`v1.0.2` 为 AGPL-3.0 + 商业许可双轨制；
-> **自下一版本起改为 MIT License**。已发布版本的授权不因本次变更而改变。
-
-第三方组件许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)（marked、DOMPurify，均为宽松许可）。
