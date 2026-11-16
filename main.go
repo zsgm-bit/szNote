@@ -11,6 +11,7 @@ package main
 import (
 	"archive/zip"
 	"bytes"
+	"compress/gzip"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -1890,6 +1891,89 @@ func cleanOnce() {
 
 // ---------- 安全响应头 & 全局限速中间件 ----------
 
+// gzipWriterPool 复用 gzip.Writer，降低弱主机上的分配开销
+var gzipWriterPool = sync.Pool{New: func() any { w := gzip.NewWriter(nil); w.Reset(&noopWriter{}); return w }}
+
+type noopWriter struct{}
+
+func (noopWriter) Write(b []byte) (int, error) { return len(b), nil }
+
+// gzWriter 按响应内容类型决定是否压缩：文本类（HTML/CSS/JS/JSON/SVG）压缩，
+// 二进制（zip、图片、附件）直通；实现在首次 Write 时依 Content-Type 判定。
+type gzWriter struct {
+	http.ResponseWriter
+	poolWriter *gzip.Writer
+	eligible   bool // 客户端接受 gzip
+	active     bool // 本响应实际在压缩
+	wroteHead  bool
+}
+
+func (g *gzWriter) decide() {
+	if g.wroteHead {
+		return
+	}
+	g.wroteHead = true
+	ct := g.Header().Get("Content-Type")
+	textual := strings.HasPrefix(ct, "text/") ||
+		strings.Contains(ct, "javascript") ||
+		strings.Contains(ct, "json") ||
+		strings.Contains(ct, "image/svg")
+	if g.eligible && textual {
+		g.Header().Del("Content-Length")
+		g.Header().Set("Content-Encoding", "gzip")
+		g.Header().Add("Vary", "Accept-Encoding")
+		g.poolWriter.Reset(g.ResponseWriter)
+		g.active = true
+	}
+}
+
+func (g *gzWriter) WriteHeader(code int) {
+	// ServeContent 等处理器会显式调用 WriteHeader，之后响应头即冻结——
+	// 压缩判定必须在此之前完成
+	g.decide()
+	g.ResponseWriter.WriteHeader(code)
+}
+
+func (g *gzWriter) Write(b []byte) (int, error) {
+	g.decide()
+	if g.active {
+		return g.poolWriter.Write(b)
+	}
+	return g.ResponseWriter.Write(b)
+}
+
+func (g *gzWriter) Flush() {
+	if g.active {
+		g.poolWriter.Flush()
+	}
+	if f, ok := g.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// gzipMiddleware 对页面 / 静态资源 / 普通 JSON API 做 gzip 压缩。
+// 明确排除：带 Range 的请求（断点续传语义不可破坏）与互传下载（zip 已压缩且走 ServeContent）。
+func gzipMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p := r.URL.Path
+		eligible := strings.HasPrefix(p, "/static/") || p == "/" ||
+			(strings.HasPrefix(p, "/api/") && !strings.HasPrefix(p, "/api/transfer/download"))
+		if !eligible || r.Header.Get("Range") != "" ||
+			!strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		g := &gzWriter{ResponseWriter: w, poolWriter: gzipWriterPool.Get().(*gzip.Writer), eligible: true}
+		defer func() {
+			if g.active {
+				g.poolWriter.Close()
+			}
+			gzipWriterPool.Put(g.poolWriter)
+		}()
+		next.ServeHTTP(g, r)
+	})
+}
+
 // securityHeaders 为所有响应补齐安全头（页面 CSP 收紧到同源；/f/ 附件由处理器覆盖为 sandbox）
 func securityHeaders(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2070,7 +2154,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              ":" + port,
-		Handler:           securityHeaders(rateLimit(mux)),
+		Handler:           securityHeaders(gzipMiddleware(rateLimit(mux))),
 		ReadHeaderTimeout: 10 * time.Second, // 防 Slowloris
 		ReadTimeout:       10 * time.Minute, // 覆盖大文件慢速上传
 		WriteTimeout:      0,                // 大文件限速下载可能很慢，交给 IdleTimeout

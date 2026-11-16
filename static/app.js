@@ -131,7 +131,22 @@ function insertAtCursor(text) {
 
 /* ---------- 路由：登录门禁 → 首页 or 编辑器 ---------- */
 
-async function boot() {
+/* 路由骨架同步显示：不依赖任何网络请求，首屏立即可见（LCP 不再被请求链拖住）。
+   鉴权探测 / 配置下发在骨架显示后异步进行。 */
+function boot() {
+  if (!slug) {
+    setupHome();          // #home 在 HTML 中默认可见
+  } else {
+    $("home").classList.add("hidden");
+    $("editor").classList.remove("hidden");
+    setupEditor();
+    setStatus("加载中…");
+  }
+  refreshAuthAndConfig();
+}
+
+/* 异步：健康检查 → 会话探测 → 互传配置应用 */
+async function refreshAuthAndConfig() {
   let needsLogin = false;
   try {
     const h = await (await fetch("/api/health")).json();
@@ -148,13 +163,7 @@ async function boot() {
     return;
   }
   if (HEALTH.auth) startSessionWatch();
-  if (!slug) {
-    $("home").classList.remove("hidden");
-    setupHome();
-  } else {
-    $("editor").classList.remove("hidden");
-    setupEditor();
-  }
+  if (slug && typeof applySwapConfig === "function") applySwapConfig();
 }
 boot();
 
@@ -654,8 +663,8 @@ function renderFiles(files) {
 
 /* ---------- 文件互传（服务器中转） ---------- */
 
-/* 弹窗开关 / 标签页 */
-function setupSwap() {
+/* 互传配置应用：HEALTH 就绪后调用（按钮显隐 / accept / 限速提示） */
+function applySwapConfig() {
   const T = HEALTH.transfer || {};
   if (T.enabled === false) { // 配置里关掉了：隐藏入口
     $("btnSwap").classList.add("hidden");
@@ -669,7 +678,11 @@ function setupSwap() {
     if (T.down_kbps) parts.push("下载限速 " + T.down_kbps + " KB/s");
     $("sendHint").textContent = parts.join(" · ");
   }
+}
 
+/* 弹窗开关 / 标签页。依赖 /api/health 的配置应用拆到 applySwapConfig()，
+   由 boot 的异步阶段在 HEALTH 就绪后调用（首屏显示不再等待网络）。 */
+function setupSwap() {
   $("btnSwap").onclick = () => { $("swapMask").classList.remove("hidden"); loadRecvList(); };
   $("swapClose").onclick = () => $("swapMask").classList.add("hidden");
   $("swapMask").addEventListener("click", (e) => {
