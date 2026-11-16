@@ -439,7 +439,7 @@ function setupEditor() {
   setupSwap();
 
   /* 宽屏默认分屏：粘贴图片/文字当场就能看到效果 */
-  setPreviewMode(window.innerWidth > 860 ? 1 : 0);
+  setPreviewMode(window.innerWidth > 900 ? 1 : 0);
 
   load();
 }
@@ -666,7 +666,7 @@ function renderFiles(files) {
     } else {
       thumb = document.createElement("span");
       thumb.className = "ficon";
-      thumb.textContent = "📄";
+      thumb.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#icon-note"></use></svg>';
     }
 
     /* 文件名：点击直接下载 */

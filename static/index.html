@@ -3,8 +3,9 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
 <title>szNote</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%9D%3C/text%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%234f46e5'/%3E%3Cpath d='M20 14h16l8 8v28H20z' fill='white'/%3E%3Cpath d='M36 14v10h8' fill='%23c7d2fe'/%3E%3Cpath d='M26 30h12M26 37h12M26 44h8' stroke='%234f46e5' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="/static/style.css?v=__V__">
 <!-- preload 让脚本与样式并行下载：窄带下每个请求都要几百毫秒 -->
 <link rel="preload" as="script" href="/static/app.js?v=__V__">
@@ -16,53 +17,73 @@
 </head>
 <body>
 
+<svg class="icon-sprite" aria-hidden="true" width="0" height="0">
+  <symbol id="icon-note" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/><path d="M14 2v6h6M8 13h8M8 17h6"/></symbol>
+  <symbol id="icon-lock" viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></symbol>
+  <symbol id="icon-markdown" viewBox="0 0 24 24"><rect x="2" y="5" width="20" height="14" rx="2"/><path d="M5 15V9l2 2 2-2v6M14 9v6M12 12l2 3 2-3M19 9v6"/></symbol>
+  <symbol id="icon-image" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="m21 15-5-5L5 21"/></symbol>
+  <symbol id="icon-upload" viewBox="0 0 24 24"><path d="M12 16V3M7 8l5-5 5 5M5 14v5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-5"/></symbol>
+  <symbol id="icon-dice" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 8h.01M16 8h.01M12 12h.01M8 16h.01M16 16h.01" stroke-width="3"/></symbol>
+  <symbol id="icon-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5M12 8h.01" stroke-width="2"/></symbol>
+  <symbol id="icon-swap" viewBox="0 0 24 24"><path d="m17 3 4 4-4 4M3 7h18M7 21l-4-4 4-4M21 17H3"/></symbol>
+  <symbol id="icon-download" viewBox="0 0 24 24"><path d="M12 3v13M7 11l5 5 5-5M5 21h14"/></symbol>
+  <symbol id="icon-logout" viewBox="0 0 24 24"><path d="M10 17l5-5-5-5M15 12H3M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/></symbol>
+  <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+</svg>
+
 <!-- ========== 登录（站点密码启用时显示） ========== -->
 <main id="login" class="hidden">
   <div class="home-card">
-    <h1>🔒 szNote</h1>
-    <p class="muted">本站已启用访问密码，请先登录</p>
+    <div class="home-logo" aria-hidden="true"><svg class="icon"><use href="#icon-lock"></use></svg></div>
+    <h1>szNote</h1>
+    <p class="muted home-intro">本站已启用访问密码，请先登录</p>
     <div class="home-form">
-      <input id="loginPassword" type="password" placeholder="访问密码" autocomplete="current-password">
-      <button id="btnLogin" class="primary">登录</button>
+      <input id="loginPassword" type="password" placeholder="访问密码" aria-label="访问密码" autocomplete="current-password">
+      <button id="btnLogin" type="button" class="primary">登录</button>
     </div>
-    <p id="loginError" class="hint danger hidden"></p>
+    <p id="loginError" class="hint danger hidden" role="alert"></p>
   </div>
 </main>
 
 <!-- ========== 首页：新建/打开笔记（默认显示；编辑器路由由 app.js 同步切换） ========== -->
 <main id="home">
   <div class="home-card">
-    <h1>📝 szNote</h1>
-    <p class="muted">即开即用的共享笔记 · 支持 Markdown · 图片粘贴 · 文件上传<br>
-    24 小时无人访问自动删除</p>
+    <div class="home-logo" aria-hidden="true"><svg class="icon"><use href="#icon-note"></use></svg></div>
+    <h1>szNote</h1>
+    <p class="muted home-intro">即开即用的共享笔记，无需注册<br>24 小时无人访问自动删除</p>
+    <ul class="feature-list" aria-label="主要功能">
+      <li><svg class="icon" aria-hidden="true"><use href="#icon-markdown"></use></svg>Markdown</li>
+      <li><svg class="icon" aria-hidden="true"><use href="#icon-image"></use></svg>图片粘贴</li>
+      <li><svg class="icon" aria-hidden="true"><use href="#icon-upload"></use></svg>文件上传</li>
+    </ul>
     <div class="home-form">
-      <input id="customSlug" type="text" maxlength="64" placeholder="自定义地址（可选），如 meeting-notes" autocomplete="off">
-      <button id="btnOpen" class="primary">打开 / 创建</button>
+      <input id="customSlug" type="text" maxlength="64" placeholder="自定义地址（可选），如 meeting-notes" aria-label="自定义笔记地址" autocomplete="off">
+      <button id="btnOpen" type="button" class="primary">打开 / 创建</button>
     </div>
-    <button id="btnRandom" class="ghost">🎲 随机一个笔记</button>
-    <p class="hint muted">地址仅允许字母、数字、<code>-</code>、<code>_</code>，长度 6–64 位；任何知道地址的人都能查看和编辑。</p>
+    <button id="btnRandom" type="button" class="ghost"><svg class="icon" aria-hidden="true"><use href="#icon-dice"></use></svg>随机一个笔记</button>
+    <p class="hint muted home-hint"><svg class="icon" aria-hidden="true"><use href="#icon-info"></use></svg><span>地址仅允许字母、数字、<code>-</code>、<code>_</code>，长度 6–64 位；任何知道地址的人都能查看和编辑。</span></p>
   </div>
 </main>
 
 <!-- ========== 编辑器页 ========== -->
 <main id="editor" class="hidden">
   <header class="topbar">
-    <a class="brand" href="/">📝 szNote</a>
+    <a class="brand" href="/" aria-label="szNote 首页"><span class="brand-badge" aria-hidden="true"><svg class="icon"><use href="#icon-note"></use></svg></span>szNote</a>
     <span id="statusWrap">
-      <button id="btnPlain" title="切换纯文本模式：不解析 Markdown，日志与命令原样显示">Markdown</button>
-      <button id="modeTag" class="hidden" title="预览"></button>
-      <span id="status" class="muted"></span>
+      <button id="btnPlain" type="button" title="切换纯文本模式：不解析 Markdown，日志与命令原样显示">Markdown</button>
+      <button id="modeTag" type="button" class="hidden" title="预览"></button>
+      <span id="status" class="muted" role="status" aria-live="polite"></span>
     </span>
     <div class="top-actions">
-      <button id="btnSwap" title="文件互传：发送 / 接收（服务器中转）">文件互传</button>
-      <select id="ttlSelect" title="无人访问保留时长：到期后笔记与附件自动删除">
+      <button id="btnSwap" type="button" title="文件互传：发送 / 接收（服务器中转）"><svg class="icon" aria-hidden="true"><use href="#icon-swap"></use></svg>文件互传</button>
+      <select id="ttlSelect" aria-label="无人访问保留时长" title="无人访问保留时长：到期后笔记与附件自动删除">
         <option value="24" selected title="1 天无人访问后删除">1 天</option>
         <option value="72" title="3 天无人访问后删除">3 天</option>
         <option value="120" title="5 天无人访问后删除">5 天</option>
         <option value="168" title="7 天无人访问后删除">7 天</option>
       </select>
-      <button id="btnExport" title="打包下载正文和附件">导出笔记</button>
-      <button id="btnLogout" class="ghost" title="退出登录">退出</button>
+      <button id="btnExport" type="button" title="打包下载正文和附件"><svg class="icon" aria-hidden="true"><use href="#icon-download"></use></svg>导出笔记</button>
+      <button id="btnLogout" type="button" class="ghost" title="退出登录"><svg class="icon" aria-hidden="true"><use href="#icon-logout"></use></svg>退出</button>
     </div>
   </header>
 
@@ -70,47 +91,47 @@
   <div id="plainHint" class="hidden">
     <span class="ph-badge">纯文本</span>
     <span class="ph-text">原样显示，不解析 Markdown。适合贴日志、命令、配置。</span>
-    <button id="btnCopyAll" class="mini">复制全部</button>
-    <button id="btnPlainOff" class="mini">切回 Markdown</button>
+    <button id="btnCopyAll" type="button" class="mini">复制全部</button>
+    <button id="btnPlainOff" type="button" class="mini">切回 Markdown</button>
   </div>
 
   <div class="editor-body">
-    <section id="panes">
-      <textarea id="content" spellcheck="false" placeholder="在这里输入 Markdown…&#10;&#10;支持直接 Ctrl+V 粘贴截图，或把文件拖进来。"></textarea>
-      <div id="splitV" class="divider v" title="拖动调整宽度"></div>
-      <div id="preview" class="markdown hidden"></div>
+    <section id="panes" aria-label="笔记工作区">
+      <textarea id="content" spellcheck="false" aria-label="笔记内容" placeholder="在这里输入 Markdown…&#10;&#10;支持直接 Ctrl+V 粘贴截图，或把文件拖进来。"></textarea>
+      <div id="splitV" class="divider v" role="separator" tabindex="0" aria-label="调整编辑器与预览比例" aria-valuemin="10" aria-valuemax="95" aria-valuenow="50" title="拖动调整宽度"></div>
+      <div id="preview" class="markdown hidden" aria-label="Markdown 预览"></div>
     </section>
 
-    <div id="splitH" class="divider h" title="拖动调整宽度"></div>
+    <div id="splitH" class="divider h" title="拖动调整附件栏宽度"></div>
 
-    <aside id="filesPanel">
-      <h3>附件 <button id="btnUpload" class="mini" title="上传附件（也可直接把文件拖进来）">＋ 上传附件</button></h3>
+    <aside id="filesPanel" aria-label="附件列表">
+      <h3>附件 <button id="btnUpload" type="button" class="mini" title="上传附件（也可直接把文件拖进来）">＋ 上传附件</button></h3>
       <ul id="fileList"></ul>
       <p id="filesEmpty" class="muted">暂无附件。粘贴图片、上传文件或直接把文件拖到这里。</p>
     </aside>
   </div>
 
-  <input id="fileInput" type="file" multiple hidden>
+  <input id="fileInput" type="file" multiple hidden aria-label="选择要上传的附件">
 </main>
 
 <!-- ========== 文件互传弹窗 ========== -->
 <div id="swapMask" class="modal-mask hidden">
-  <div class="modal">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="swapTitle">
     <div class="modal-head">
-      <h3>文件互传</h3>
-      <button id="swapClose" class="mini" title="关闭">✕</button>
+      <h3 id="swapTitle">文件互传</h3>
+      <button id="swapClose" type="button" class="mini" title="关闭" aria-label="关闭文件互传弹窗"><svg class="icon" aria-hidden="true"><use href="#icon-close"></use></svg></button>
     </div>
-    <div class="swap-tabs">
-      <button id="tabSend" class="active">发送文件</button>
-      <button id="tabRecv">接收文件</button>
+    <div class="swap-tabs" aria-label="文件互传方式">
+      <button id="tabSend" type="button" class="active">发送文件</button>
+      <button id="tabRecv" type="button">接收文件</button>
     </div>
 
     <!-- 发送 -->
     <div id="paneSend">
-      <input id="swapFile" type="file" hidden>
+      <input id="swapFile" type="file" hidden accept=".zip" aria-label="选择要发送的文件">
       <div id="sendIdle">
-        <button id="btnPickFile" class="primary">选择文件…</button>
-        <p id="sendHint" class="hint muted"></p>
+        <button id="btnPickFile" type="button" class="primary">选择文件…</button>
+        <p id="sendHint" class="hint muted">允许的类型：.zip · 单文件上限 50 MB</p>
       </div>
       <div id="sendBusy" class="hidden">
         <p id="sendName" class="send-name"></p>
@@ -120,7 +141,7 @@
       <div id="sendDone" class="hidden">
         <p class="muted">发送完成！把取件码告诉接收方：</p>
         <p class="code-row"><code id="sendCode"></code>
-          <button id="btnCopyCode" class="mini">复制</button></p>
+          <button id="btnCopyCode" type="button" class="mini">复制</button></p>
         <p id="sendExpires" class="hint muted"></p>
       </div>
     </div>
@@ -128,8 +149,8 @@
     <!-- 接收 -->
     <div id="paneRecv" class="hidden">
       <div class="recv-row">
-        <input id="swapCode" type="text" maxlength="16" placeholder="输入取件码" autocomplete="off">
-        <button id="btnQueryCode" class="primary">查询</button>
+        <input id="swapCode" type="text" maxlength="16" placeholder="输入取件码" aria-label="取件码" autocomplete="off">
+        <button id="btnQueryCode" type="button" class="primary">查询</button>
       </div>
       <ul id="recvList"></ul>
       <div id="recvBusy" class="hidden">
@@ -142,7 +163,7 @@
   </div>
 </div>
 
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <!--EDITOR_SCRIPTS_START-->
 <!-- 仅编辑器页需要，实际由 app.js 按需动态加载（见 head 里的 meta[name=md-libs]）；
