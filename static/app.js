@@ -209,7 +209,13 @@ async function refreshAuthAndConfig() {
   if (HEALTH.auth) startSessionWatch();
   if (slug && typeof applySwapConfig === "function") applySwapConfig();
 }
-boot();
+/* async 脚本可能在 DOM 解析完成前执行：解析未完则挂到 DOMContentLoaded，
+   避免在半成品 DOM 上初始化（也顺带让首绘完全不被脚本决策拖住） */
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", boot, { once: true });
+} else {
+  boot();
+}
 
 /* ---------- 登录 ---------- */
 
@@ -350,6 +356,13 @@ function setupEditor() {
   panel.addEventListener("drop", (e) => {
     for (const f of e.dataTransfer.files) uploadFile(f, f.type.startsWith("image/"), false);
   });
+
+  /* 服务端已把已存在笔记的正文内嵌进 textarea：首屏立即渲染（库未就绪时按纯文本显示，
+     Markdown 视图由 loadMdLibs + DOMContentLoaded 升级）。接口返回后由 load() 校正状态。 */
+  if (ta.value) {
+    render();
+    setStatus("已加载");
+  }
 
   ta.addEventListener("input", () => {
     dirty = true;
@@ -724,39 +737,63 @@ function applySwapConfig() {
   }
 }
 
-/* 弹窗开关 / 标签页。依赖 /api/health 的配置应用拆到 applySwapConfig()，
-   由 boot 的异步阶段在 HEALTH 就绪后调用（首屏显示不再等待网络）。 */
-function setupSwap() {
-  $("btnSwap").onclick = () => { $("swapMask").classList.remove("hidden"); loadRecvList(); };
-  $("swapClose").onclick = () => $("swapMask").classList.add("hidden");
-  $("swapMask").addEventListener("click", (e) => {
-    if (e.target === $("swapMask")) $("swapMask").classList.add("hidden");
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !$("swapMask").classList.contains("hidden")) {
-      $("swapMask").classList.add("hidden");
-    }
-  });
+/* 弹窗开关 / 拖放上传。依赖 /api/health 的配置应用拆到 applySwapConfig()，
+   由 boot 的异步阶段在 HEALTH 就绪后调用（首屏显示不再等待网络）。
+   无取件码：上传完成后文件直接出现在列表里，下载 / 撤回都在行内。 */
+let swapPoll = null;
 
-  const setTab = (send) => {
-    $("tabSend").classList.toggle("active", send);
-    $("tabRecv").classList.toggle("active", !send);
-    $("paneSend").classList.toggle("hidden", !send);
-    $("paneRecv").classList.toggle("hidden", send);
-    if (!send) loadRecvList();
+function setupSwap() {
+  const open = () => {
+    $("swapMask").classList.remove("hidden");
+    loadRecvList();
+    clearInterval(swapPoll);
+    swapPoll = setInterval(() => {           // 弹窗开着时自动刷新，对方上传的文件会自己出现
+      if (!$("swapMask").classList.contains("hidden")) loadRecvList();
+    }, 5000);
   };
-  $("tabSend").onclick = () => setTab(true);
-  $("tabRecv").onclick = () => setTab(false);
+  const close = () => {
+    $("swapMask").classList.add("hidden");
+    clearInterval(swapPoll);
+    swapPoll = null;
+  };
+  $("btnSwap").onclick = open;
+  $("swapClose").onclick = close;
+  $("swapMask").addEventListener("click", (e) => { if (e.target === $("swapMask")) close(); });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("swapMask").classList.contains("hidden")) close();
+  });
 
   $("btnPickFile").onclick = () => $("swapFile").click();
   $("swapFile").addEventListener("change", (e) => {
-    const f = e.target.files[0];
+    const files = Array.from(e.target.files || []);
     e.target.value = "";
-    if (f) startSend(f);
+    queueSend(files);
   });
-  $("btnCopyCode").onclick = () => copyText($("sendCode").textContent);
-  $("btnQueryCode").onclick = queryCode;
-  $("swapCode").addEventListener("keydown", (e) => { if (e.key === "Enter") queryCode(); });
+  $("btnRefreshList").onclick = () => loadRecvList();
+
+  /* 拖入上传：整块上传区都是投放目标 */
+  const dz = $("swapDrop");
+  const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+  ["dragenter", "dragover"].forEach((ev) =>
+    dz.addEventListener(ev, (e) => { stop(e); dz.classList.add("dragging"); }));
+  ["dragleave", "dragend"].forEach((ev) =>
+    dz.addEventListener(ev, (e) => { stop(e); dz.classList.remove("dragging"); }));
+  dz.addEventListener("drop", (e) => {
+    stop(e);
+    dz.classList.remove("dragging");
+    const files = Array.from((e.dataTransfer && e.dataTransfer.files) || []);
+    queueSend(files);
+  });
+}
+
+/* 多个文件按顺序上传，避免并发抢同一条上行链路 */
+let sendQueue = Promise.resolve();
+function queueSend(files) {
+  if (!files.length) return;
+  sendQueue = sendQueue.then(async () => {
+    for (const f of files) await startSend(f);
+    await loadRecvList();
+  }).catch(() => {});
 }
 
 function randomHex(nBytes) {
@@ -828,8 +865,6 @@ async function startSend(file) {
   const same = prev && prev.name === file.name && prev.size === file.size && prev.mtime === file.lastModified;
   const token = (same && prev.token) || randomHex(32);
 
-  $("sendIdle").classList.add("hidden");
-  $("sendDone").classList.add("hidden");
   $("sendBusy").classList.remove("hidden");
   $("sendName").textContent = file.name;
   const bar = $("sendBar"), stat = $("sendStat");
@@ -854,10 +889,13 @@ async function startSend(file) {
         });
         if (r.status === 401) { showLoginScreen("登录已超时，请重新登录"); return; }
         const d = await r.json().catch(() => ({}));
+        // 4xx 是确定性失败（类型不符、超限、PK 头校验不过），重试没有意义
+        if (r.status >= 400 && r.status < 500) throw Object.assign(new Error(d.error || "http " + r.status), { fatal: true });
         if (!r.ok) throw new Error(d.error || "http " + r.status);
         offset = typeof d.offset === "number" ? d.offset : end;
         fails = 0;
       } catch (err) {
+        if (err.fatal) throw err;
         fails++;
         if (fails >= 5) throw err;
         await new Promise((res) => setTimeout(res, 1200 * fails));
@@ -872,17 +910,14 @@ async function startSend(file) {
     await postJSON(`/api/transfer/${code}/complete`, {});
     localStorage.removeItem("szn.tr.resume");
     $("sendBusy").classList.add("hidden");
-    $("sendDone").classList.remove("hidden");
-    $("sendCode").textContent = code;
-    $("sendExpires").textContent = "接收方可在「接收文件」列表里直接看到该文件；到期后服务器自动清理。";
+    toast("已上传，可直接在列表里下载或撤回");
   } catch (err) {
     $("sendBusy").classList.add("hidden");
-    $("sendIdle").classList.remove("hidden");
     toast("发送中断：" + (err.message || "网络错误") + "（进度已保留，重选同一文件可续传）");
   }
 }
 
-/* 接收：待取列表 + 取件码查询 */
+/* 文件列表：无取件码，直接列出中转文件（下载 / 撤回） */
 async function loadRecvList() {
   const ul = $("recvList");
   ul.innerHTML = "";
@@ -898,7 +933,7 @@ async function loadRecvList() {
       const info = document.createElement("span");
       info.className = "recv-info";
       info.textContent = it.name + "（" + fmtSize(it.size) + "）";
-      info.title = "取件码 " + it.code;
+      info.title = it.name;
       const dl = document.createElement("button");
       dl.className = "mini primary";
       dl.textContent = "下载";
@@ -916,21 +951,6 @@ async function loadRecvList() {
       ul.appendChild(li);
     }
   } catch { /* 列表拉取失败不打扰用户 */ }
-}
-
-async function queryCode() {
-  const code = $("swapCode").value.trim();
-  if (!code) { toast("请输入取件码"); return; }
-  try {
-    const r = await fetch("/api/transfer/info?code=" + encodeURIComponent(code));
-    if (r.status === 401) { showLoginScreen("登录已超时，请重新登录"); return; }
-    const d = await r.json();
-    if (!r.ok) { toast(d.error || "取件码不存在"); return; }
-    if (!d.ready) { toast("该文件尚未发送完成"); return; }
-    downloadTransfer(d.code, d.name, d.size);
-  } catch {
-    toast("查询失败，请重试");
-  }
 }
 
 /* 下载：ReadableStream 逐块计数展示进度；中断后用 Range 从已收字节续传 */

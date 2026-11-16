@@ -745,6 +745,39 @@ code, .mono { font-family: var(--font-mono); }
 #sendIdle { padding: 6px 0 2px; text-align: center; }
 #sendHint { margin-top: 12px; }
 .send-name { margin: 0 0 12px; color: #344054; font-weight: 650; font-size: 13px; overflow-wrap: anywhere; }
+/* 互传：拖放上传区（点击或拖入），边框用 inset，避免布局抖动 */
+.dropzone {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 20px 0;
+  padding: 22px 18px 18px;
+  border-radius: 12px;
+  background: #fbfcff;
+  box-shadow: inset 0 0 0 1px #e4e8ef;
+  text-align: center;
+  transition: background-color var(--duration), box-shadow var(--duration);
+}
+.dropzone.dragging {
+  background: #eef2ff;
+  box-shadow: inset 0 0 0 2px var(--primary);
+}
+.dropzone-tip { margin: 0; color: #667085; font-size: 13px; }
+.dropzone .hint { margin: 0; }
+
+.swap-list-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin: 18px 20px 8px;
+  color: #667085;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .02em;
+}
+#recvList { margin: 0 20px; padding: 0; list-style: none; }
+
 .prog {
   height: 10px;
   overflow: hidden;
@@ -776,7 +809,7 @@ code, .mono { font-family: var(--font-mono); }
   text-align: center;
   overflow-wrap: anywhere;
 }
-#recvList { margin: 14px 0 0; padding: 0; list-style: none; }
+#recvList { margin: 0; padding: 0; list-style: none; }
 #recvList li {
   padding: 0;
   border: 0;

@@ -6,9 +6,13 @@
 <meta name="color-scheme" content="light">
 <title>szNote</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='16' fill='%234f46e5'/%3E%3Cpath d='M20 14h16l8 8v28H20z' fill='white'/%3E%3Cpath d='M36 14v10h8' fill='%23c7d2fe'/%3E%3Cpath d='M26 30h12M26 37h12M26 44h8' stroke='%234f46e5' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/style.css?v=__V__">
-<!-- preload 让脚本与样式并行下载：窄带下每个请求都要几百毫秒 -->
+<!-- preload 必须在样式之前：内联的大段 CSS 在 head 里占据字节流，
+     preload 在前才能让 app.js 与 HTML 剩余部分并行下载 -->
 <link rel="preload" as="script" href="/static/app.js?v=__V__">
+<link rel="stylesheet" href="/static/style.css?v=__V__">
+<!-- async：完全不参与首绘决策（defer 实测会被 Chrome 拖到脚本执行完才画）；
+     boot() 内部有 readyState 守卫，执行早于解析完成时自动挂到 DOMContentLoaded -->
+<script async src="/static/app.js?v=__V__"></script>
 <!--EDITOR_PRELOAD_START-->
 <!-- Markdown 库由 app.js 按需动态加载：同步写在 HTML 里会和 app.js 抢窄带，
      把「app.js → 接口 → 内容」这条关键链拖慢。这里只声明地址（含版本号）。 -->
@@ -97,7 +101,8 @@
 
   <div class="editor-body">
     <section id="panes" aria-label="笔记工作区">
-      <textarea id="content" spellcheck="false" aria-label="笔记内容" placeholder="在这里输入 Markdown…&#10;&#10;支持直接 Ctrl+V 粘贴截图，或把文件拖进来。"></textarea>
+<!-- __BOOT__：服务端把已存在笔记的正文（HTML 转义后）替换到这里，首屏即见全文 -->
+      <textarea id="content" spellcheck="false" aria-label="笔记内容" placeholder="在这里输入 Markdown…&#10;&#10;支持直接 Ctrl+V 粘贴截图，或把文件拖进来。">__BOOT__</textarea>
       <div id="splitV" class="divider v" role="separator" tabindex="0" aria-label="调整编辑器与预览比例" aria-valuemin="10" aria-valuemax="95" aria-valuenow="50" title="拖动调整宽度"></div>
       <div id="preview" class="markdown hidden" aria-label="Markdown 预览"></div>
     </section>
@@ -121,44 +126,32 @@
       <h3 id="swapTitle">文件互传</h3>
       <button id="swapClose" type="button" class="mini" title="关闭" aria-label="关闭文件互传弹窗"><svg class="icon" aria-hidden="true"><use href="#icon-close"></use></svg></button>
     </div>
-    <div class="swap-tabs" aria-label="文件互传方式">
-      <button id="tabSend" type="button" class="active">发送文件</button>
-      <button id="tabRecv" type="button">接收文件</button>
+
+    <!-- 上传区：点击或拖入都行，上传完成后文件直接出现在下方列表 -->
+    <div id="swapDrop" class="dropzone">
+      <input id="swapFile" type="file" multiple hidden accept=".zip" aria-label="选择要上传的文件">
+      <button id="btnPickFile" type="button" class="primary">选择文件…</button>
+      <p class="dropzone-tip">把文件拖到这里，或点击选择</p>
+      <p id="sendHint" class="hint muted">允许的类型：.zip · 单文件上限 50 MB</p>
     </div>
 
-    <!-- 发送 -->
-    <div id="paneSend">
-      <input id="swapFile" type="file" hidden accept=".zip" aria-label="选择要发送的文件">
-      <div id="sendIdle">
-        <button id="btnPickFile" type="button" class="primary">选择文件…</button>
-        <p id="sendHint" class="hint muted">允许的类型：.zip · 单文件上限 50 MB</p>
-      </div>
-      <div id="sendBusy" class="hidden">
-        <p id="sendName" class="send-name"></p>
-        <div class="prog"><div class="prog-bar" id="sendBar"></div></div>
-        <p id="sendStat" class="stat mono muted"></p>
-      </div>
-      <div id="sendDone" class="hidden">
-        <p class="muted">发送完成！把取件码告诉接收方：</p>
-        <p class="code-row"><code id="sendCode"></code>
-          <button id="btnCopyCode" type="button" class="mini">复制</button></p>
-        <p id="sendExpires" class="hint muted"></p>
-      </div>
+    <div id="sendBusy" class="hidden">
+      <p id="sendName" class="send-name"></p>
+      <div class="prog"><div class="prog-bar" id="sendBar"></div></div>
+      <p id="sendStat" class="stat mono muted"></p>
     </div>
 
-    <!-- 接收 -->
-    <div id="paneRecv" class="hidden">
-      <div class="recv-row">
-        <input id="swapCode" type="text" maxlength="16" placeholder="输入取件码" aria-label="取件码" autocomplete="off">
-        <button id="btnQueryCode" type="button" class="primary">查询</button>
-      </div>
-      <ul id="recvList"></ul>
-      <div id="recvBusy" class="hidden">
-        <p id="recvName" class="send-name"></p>
-        <div class="prog"><div class="prog-bar" id="recvBar"></div></div>
-        <p id="recvStat" class="stat mono muted"></p>
-      </div>
-      <p id="recvEmpty" class="hint muted">暂无待接收的文件。</p>
+    <div class="swap-list-head">
+      <span>文件列表</span>
+      <button id="btnRefreshList" type="button" class="mini" title="重新拉取列表">刷新</button>
+    </div>
+    <ul id="recvList"></ul>
+    <p id="recvEmpty" class="hint muted">还没有中转文件。上传后会直接出现在这里。</p>
+
+    <div id="recvBusy" class="hidden">
+      <p id="recvName" class="send-name"></p>
+      <div class="prog"><div class="prog-bar" id="recvBar"></div></div>
+      <p id="recvStat" class="stat mono muted"></p>
     </div>
   </div>
 </div>
@@ -169,6 +162,5 @@
 <!-- 仅编辑器页需要，实际由 app.js 按需动态加载（见 head 里的 meta[name=md-libs]）；
      首页由服务端把这段连同 meta 一起裁掉，首屏少下载约 27 KB。 -->
 <!--EDITOR_SCRIPTS_END-->
-<script src="/static/app.js?v=__V__"></script>
 </body>
 </html>

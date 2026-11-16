@@ -1782,33 +1782,56 @@ var staticVer = func() string {
 }()
 
 // 两版页面在启动时预渲染（弱主机上避免每请求做十几次字符串替换）：
-// home —— 内联 CSS + 不含 markdown 库；editor —— 内联 CSS + marked/purify。
+// 两页都内联 CSS（渲染不再等外链样式表的第二个 RTT），head 里的
+// preload 让 app.js 与 HTML 剩余部分并行下载；
+// home —— 额外裁掉 markdown 库相关内容；editor —— 保留。
 var (
 	pageHome   = buildPage(false)
 	pageEditor = buildPage(true)
 )
 
-// buildPage 按页面准备 HTML：首页内联样式表并裁掉用不到的脚本；
-// 编辑器页保持外链样式（内联的大段 CSS 会把 body 末尾的脚本推迟近 1 秒才被发现，
-// 而编辑器的 LCP 依赖脚本就绪 + 接口返回，外链反而更快）。
+// buildPage 按页面准备 HTML：内联压缩后的样式表，首页裁掉用不到的脚本。
 func buildPage(editor bool) []byte {
 	raw, err := fs.ReadFile(staticFS, "static/index.html")
 	if err != nil {
 		return nil
 	}
 	page := strings.ReplaceAll(string(raw), "__V__", staticVer)
+	if css, err := fs.ReadFile(staticFS, "static/style.css"); err == nil {
+		link := `<link rel="stylesheet" href="/static/style.css?v=` + staticVer + `">`
+		// __NONCE__ 每请求替换为随机值，页面 CSP 据此只放行这一块内联样式
+		page = strings.Replace(page,
+			link, `<style nonce="__NONCE__">`+minifyCSS(string(css))+`</style>`, 1)
+	}
 	if !editor {
-		if css, err := fs.ReadFile(staticFS, "static/style.css"); err == nil {
-			link := `<link rel="stylesheet" href="/static/style.css?v=` + staticVer + `">`
-			// __NONCE__ 每请求替换为随机值，页面 CSP 据此只放行这一块内联样式
-			page = strings.Replace(page,
-				link, `<style nonce="__NONCE__">`+string(css)+`</style>`, 1)
-		}
 		// 首页不解析 Markdown，marked + DOMPurify（约 27 KB）纯属浪费带宽
 		page = dropBetween(page, "<!--EDITOR_SCRIPTS_START-->", "<!--EDITOR_SCRIPTS_END-->")
 		page = dropBetween(page, "<!--EDITOR_PRELOAD_START-->", "<!--EDITOR_PRELOAD_END-->")
 	}
 	return []byte(page)
+}
+
+// minifyCSS 构建期压缩样式表（仅内联进页面用；/static/ 下原文件保持可读）。
+// 本项目的样式表不含形如 "/*" 的字符串字面量，直接按标记删除注释是安全的。
+func minifyCSS(css string) string {
+	for {
+		i := strings.Index(css, "/*")
+		if i < 0 {
+			break
+		}
+		j := strings.Index(css[i:], "*/")
+		if j < 0 {
+			css = css[:i]
+			break
+		}
+		css = css[:i] + css[i+j+2:]
+	}
+	css = strings.Join(strings.Fields(css), " ")
+	for _, sep := range []string{"{", "}", ";", ",", ":", ">"} {
+		css = strings.ReplaceAll(css, " "+sep, sep)
+		css = strings.ReplaceAll(css, sep+" ", sep)
+	}
+	return css
 }
 
 // dropBetween 删除 start 与 end 标记之间的内容（含标记）；标记缺失时原样返回。
@@ -1833,11 +1856,22 @@ func newNonce() string {
 	return hex.EncodeToString(b[:])
 }
 
+// bootCap 服务端内嵌正文的字节上限：超过则退回接口加载（避免大笔记拖慢首屏）
+const bootCap = 256 << 10
+
+// escapeHTMLRCData 为 <textarea> RCDATA 上下文转义：& < > 三个字符足够，
+// 浏览器读取 .value 时会自动还原。
+func escapeHTMLRCData(s string) string {
+	r := strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
+	return r.Replace(s)
+}
+
 // GET / 与 GET /{slug} 都返回同一个前端页面（单页应用，由 JS 区分首页/编辑器）
 func pageHandler(w http.ResponseWriter, r *http.Request) {
 	editor := false
+	slug := ""
 	if r.URL.Path != "/" {
-		slug := strings.TrimPrefix(r.URL.Path, "/")
+		slug = strings.TrimPrefix(r.URL.Path, "/")
 		if !validSlug(slug) {
 			http.Error(w, "404 页面不存在（笔记地址仅允许字母、数字、- 和 _，最长 64 字符）", http.StatusNotFound)
 			return
@@ -1845,11 +1879,39 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 		editor = true
 	}
 	tpl := pageHome
+	ttl := "public, max-age=600, stale-while-revalidate=86400" // 首页壳体几乎不变
 	if editor {
 		tpl = pageEditor
+		// 编辑器页内嵌正文，缓存窗口收紧：改动后最多 1 分钟内浏览器仍用本地副本
+		ttl = "public, max-age=60, stale-while-revalidate=600"
+		// 服务端预切骨架：编辑器页直接显示编辑器、隐藏首页，首屏绘制不依赖 app.js
+		tpl = bytes.Replace(tpl, []byte(`<main id="editor" class="hidden">`), []byte(`<main id="editor">`), 1)
+		tpl = bytes.Replace(tpl, []byte(`<main id="home">`), []byte(`<main id="home" class="hidden">`), 1)
+		// 已存在且未启用站点密码的笔记：正文直接内嵌进 textarea，首屏即见全文，
+		// 省掉「脚本就绪 → 接口往返」两跳。启用密码时绝不能内嵌，否则绕过鉴权。
+		content := ""
+		if !cfg().authOn {
+			if b, err := os.ReadFile(notePath(slug)); err == nil && len(b) > 0 && len(b) <= bootCap {
+				content = escapeHTMLRCData(string(b))
+			}
+		}
+		tpl = bytes.ReplaceAll(tpl, []byte("__BOOT__"), []byte(content))
+	} else {
+		tpl = bytes.ReplaceAll(tpl, []byte("__BOOT__"), nil)
 	}
 	if len(tpl) == 0 {
 		http.Error(w, "内部错误", http.StatusInternalServerError)
+		return
+	}
+	// 页面壳体可缓存：回访直接读磁盘缓存（stale-while-revalidate 后台刷新），
+	// LCP 趋近 0；/static/ 资源按内容哈希强缓存，旧壳体 + 新资源也能正常解析。
+	w.Header().Set("Cache-Control", ttl)
+	// ETag 基于壳体 + 内嵌正文（不含每请求变化的 nonce），后台重校验时命中 304 零传输
+	sum := sha256.Sum256(tpl)
+	etag := `"` + hex.EncodeToString(sum[:8]) + `"`
+	w.Header().Set("ETag", etag)
+	if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {
+		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	nonce := newNonce()
@@ -2035,7 +2097,11 @@ func (g *gzWriter) Flush() {
 func gzipMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
-		eligible := strings.HasPrefix(p, "/static/") || p == "/" ||
+		seg := strings.Trim(p, "/")
+		// 单段路径 = 笔记页（/、/{slug}）也要压缩：不压缩时编辑器页 35KB 裸传，
+		// 弱网下光下载就要 2 秒多——这是首页与编辑器耗时差一倍的真正原因。
+		pagePath := p == "/" || (!strings.Contains(seg, "/") && slugRe.MatchString(seg))
+		eligible := strings.HasPrefix(p, "/static/") || pagePath ||
 			(strings.HasPrefix(p, "/api/") && !strings.HasPrefix(p, "/api/transfer/download"))
 		if !eligible || r.Header.Get("Range") != "" ||
 			!strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
