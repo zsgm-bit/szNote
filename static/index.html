@@ -5,7 +5,14 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>szNote</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%93%9D%3C/text%3E%3C/svg%3E">
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=__V__">
+<!-- preload 让脚本与样式并行下载：窄带下每个请求都要几百毫秒 -->
+<link rel="preload" as="script" href="/static/app.js?v=__V__">
+<!--EDITOR_PRELOAD_START-->
+<!-- Markdown 库由 app.js 按需动态加载：同步写在 HTML 里会和 app.js 抢窄带，
+     把「app.js → 接口 → 内容」这条关键链拖慢。这里只声明地址（含版本号）。 -->
+<meta name="md-libs" content="/static/js/marked.min.js?v=__V__,/static/js/purify.min.js?v=__V__">
+<!--EDITOR_PRELOAD_END-->
 </head>
 <body>
 
@@ -18,7 +25,7 @@
       <input id="loginPassword" type="password" placeholder="访问密码" autocomplete="current-password">
       <button id="btnLogin" class="primary">登录</button>
     </div>
-    <p id="loginError" class="hint" style="color: var(--danger); display: none;"></p>
+    <p id="loginError" class="hint danger hidden"></p>
   </div>
 </main>
 
@@ -137,8 +144,10 @@
 
 <div id="toast"></div>
 
-<script src="/static/js/marked.min.js"></script>
-<script src="/static/js/purify.min.js"></script>
-<script src="/static/app.js"></script>
+<!--EDITOR_SCRIPTS_START-->
+<!-- 仅编辑器页需要，实际由 app.js 按需动态加载（见 head 里的 meta[name=md-libs]）；
+     首页由服务端把这段连同 meta 一起裁掉，首屏少下载约 27 KB。 -->
+<!--EDITOR_SCRIPTS_END-->
+<script src="/static/app.js?v=__V__"></script>
 </body>
 </html>

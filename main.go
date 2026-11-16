@@ -1766,22 +1766,101 @@ func cleanTransfers() {
 
 // ---------- 页面路由 ----------
 
+// staticVer 静态资源版本号：取关键文件的内容哈希。发版后 URL 自动变化，
+// 于是 /static/ 可以放心用一年强缓存（immutable），回访时零请求。
+var staticVer = func() string {
+	h := sha256.New()
+	for _, p := range []string{
+		"static/style.css", "static/app.js",
+		"static/js/marked.min.js", "static/js/purify.min.js",
+	} {
+		if b, err := fs.ReadFile(staticFS, p); err == nil {
+			_, _ = h.Write(b)
+		}
+	}
+	return hex.EncodeToString(h.Sum(nil))[:10]
+}()
+
+// 两版页面在启动时预渲染（弱主机上避免每请求做十几次字符串替换）：
+// home —— 内联 CSS + 不含 markdown 库；editor —— 内联 CSS + marked/purify。
+var (
+	pageHome   = buildPage(false)
+	pageEditor = buildPage(true)
+)
+
+// buildPage 按页面准备 HTML：首页内联样式表并裁掉用不到的脚本；
+// 编辑器页保持外链样式（内联的大段 CSS 会把 body 末尾的脚本推迟近 1 秒才被发现，
+// 而编辑器的 LCP 依赖脚本就绪 + 接口返回，外链反而更快）。
+func buildPage(editor bool) []byte {
+	raw, err := fs.ReadFile(staticFS, "static/index.html")
+	if err != nil {
+		return nil
+	}
+	page := strings.ReplaceAll(string(raw), "__V__", staticVer)
+	if !editor {
+		if css, err := fs.ReadFile(staticFS, "static/style.css"); err == nil {
+			link := `<link rel="stylesheet" href="/static/style.css?v=` + staticVer + `">`
+			// __NONCE__ 每请求替换为随机值，页面 CSP 据此只放行这一块内联样式
+			page = strings.Replace(page,
+				link, `<style nonce="__NONCE__">`+string(css)+`</style>`, 1)
+		}
+		// 首页不解析 Markdown，marked + DOMPurify（约 27 KB）纯属浪费带宽
+		page = dropBetween(page, "<!--EDITOR_SCRIPTS_START-->", "<!--EDITOR_SCRIPTS_END-->")
+		page = dropBetween(page, "<!--EDITOR_PRELOAD_START-->", "<!--EDITOR_PRELOAD_END-->")
+	}
+	return []byte(page)
+}
+
+// dropBetween 删除 start 与 end 标记之间的内容（含标记）；标记缺失时原样返回。
+func dropBetween(s, start, end string) string {
+	i := strings.Index(s, start)
+	if i < 0 {
+		return s
+	}
+	j := strings.Index(s[i:], end)
+	if j < 0 {
+		return s
+	}
+	return s[:i] + s[i+j+len(end):]
+}
+
+// newNonce 生成一次性 CSP nonce（随机 12 字节，hex 编码）。
+func newNonce() string {
+	var b [12]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "sznote-fallback-nonce"
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // GET / 与 GET /{slug} 都返回同一个前端页面（单页应用，由 JS 区分首页/编辑器）
 func pageHandler(w http.ResponseWriter, r *http.Request) {
+	editor := false
 	if r.URL.Path != "/" {
 		slug := strings.TrimPrefix(r.URL.Path, "/")
 		if !validSlug(slug) {
 			http.Error(w, "404 页面不存在（笔记地址仅允许字母、数字、- 和 _，最长 64 字符）", http.StatusNotFound)
 			return
 		}
+		editor = true
 	}
-	b, err := fs.ReadFile(staticFS, "static/index.html")
-	if err != nil {
+	tpl := pageHome
+	if editor {
+		tpl = pageEditor
+	}
+	if len(tpl) == 0 {
 		http.Error(w, "内部错误", http.StatusInternalServerError)
 		return
 	}
+	nonce := newNonce()
+	// 页面专属 CSP：只放行本次请求的内联样式块（nonce 每次不同），其余仍严格同源。
+	// 覆盖 securityHeaders 里的默认值；nonce 对内联 style 属性无效，故不放宽 style-src-attr。
+	w.Header().Set("Content-Security-Policy",
+		"default-src 'self'; img-src 'self' data:; script-src 'self'; "+
+			"style-src 'self' 'nonce-"+nonce+"'; connect-src 'self'; "+
+			"frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(b)
+	_, _ = w.Write(bytes.ReplaceAll(tpl, []byte("__NONCE__"), []byte(nonce)))
 }
 
 // GET /api/session —— 前端会话探测（需登录）。
@@ -1987,8 +2066,9 @@ func securityHeaders(next http.Handler) http.Handler {
 		h.Set("Permissions-Policy", "geolocation=(), camera=(), microphone=(), payment=()")
 		p := r.URL.Path
 		if strings.HasPrefix(p, "/static/") {
-			// 静态资源随版本更新：强制回源校验，杜绝「新 HTML + 旧 JS」错配
-			h.Set("Cache-Control", "no-cache")
+			// 资源 URL 带内容哈希（?v=...），发版后 URL 变化自动失效旧缓存，
+			// 因此可以长期强缓存：回访零请求，弱网下省掉 4 个 RTT
+			h.Set("Cache-Control", "public, max-age=31536000, immutable")
 		} else {
 			h.Set("Cache-Control", "no-store")
 		}

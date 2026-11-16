@@ -57,6 +57,7 @@ html, body {
 }
 #customSlug:focus, #loginPassword:focus { border-color: var(--accent); }
 .hint { font-size: 12px; margin-top: 16px; }
+.hint.danger { color: var(--danger); }
 .hint code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
 
 /* ---------- 按钮 ---------- */

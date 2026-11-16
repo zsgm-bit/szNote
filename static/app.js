@@ -53,13 +53,53 @@ function fmtSize(n) {
   return (n / 1048576).toFixed(1) + " MB";
 }
 
-/* Markdown 渲染：marked + DOMPurify，链接一律新标签打开 */
-DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-  if (node.tagName === "A") {
-    node.setAttribute("target", "_blank");
-    node.setAttribute("rel", "noopener noreferrer");
-  }
-});
+/* Markdown 渲染：marked + DOMPurify，链接一律新标签打开。
+   两个库按 defer 加载（首页根本不加载），所以这里做惰性探测：
+   库没到就先按纯文本显示，到了再补一次渲染，避免窄网下白屏好几秒。 */
+let mdReady = false;
+
+function ensureMdLibs() {
+  if (mdReady) return true;
+  if (typeof marked === "undefined" || typeof DOMPurify === "undefined") return false;
+  DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+    if (node.tagName === "A") {
+      node.setAttribute("target", "_blank");
+      node.setAttribute("rel", "noopener noreferrer");
+    }
+  });
+  mdReady = true;
+  return true;
+}
+ensureMdLibs();
+
+/* 库地址由服务端写进 meta[name="md-libs"]（带内容哈希版本号）；首页没有这个 meta。
+   动态加载而不是写死在 HTML 里：同步的 27 KB 会和 app.js 抢同一条窄带，
+   把「app.js → 接口 → 内容」这条关键链拖慢一两秒。 */
+const MD_LIBS = (() => {
+  const m = document.querySelector('meta[name="md-libs"]');
+  return m && m.content ? m.content.split(",").map((s) => s.trim()).filter(Boolean) : [];
+})();
+let mdLoading = false;
+
+function loadMdLibs() {
+  if (ensureMdLibs() || mdLoading || !MD_LIBS.length) return;
+  mdLoading = true;
+  let i = 0;
+  const next = () => {
+    if (i >= MD_LIBS.length) {
+      mdLoading = false;
+      /* 库到齐：把先前按纯文本显示的预览升级成 Markdown 视图 */
+      if (ensureMdLibs() && slug && !plainMode && $("content") && $("content").value) render();
+      return;
+    }
+    const s = document.createElement("script");
+    s.src = MD_LIBS[i++];
+    s.onload = next;
+    s.onerror = next;
+    document.head.appendChild(s);
+  };
+  next();
+}
 
 /* 净化配置：禁掉表单/样式等标签，防止笔记内伪装登录框 */
 const PURIFY_CFG = {
@@ -72,8 +112,9 @@ const PURIFY_CFG = {
 function render() {
   const src = $("content").value;
   const preview = $("preview");
-  /* 纯文本模式：不走 Markdown，直接按原文显示（textContent 天然转义，无 XSS 风险） */
-  if (plainMode) {
+  /* 纯文本模式，或 Markdown 库还没下载完：按原文显示
+     （textContent 天然转义，无 XSS 风险；库就绪后由 DOMContentLoaded 补渲染） */
+  if (plainMode || !ensureMdLibs()) {
     const pre = document.createElement("pre");
     pre.className = "plaintext";
     pre.textContent = src || "（空笔记）";
@@ -86,6 +127,8 @@ function render() {
   preview.innerHTML = DOMPurify.sanitize(html, PURIFY_CFG);
   decorateCodeBlocks();
 }
+
+/* defer 脚本在 DOMContentLoaded 前执行完毕，此刻再补一次渲染即可升级为 Markdown 视图 */
 
 /* 给每个代码块加「复制」按钮：复制内容保持原始缩进/换行，可直接粘进 Linux / Windows 终端 */
 function decorateCodeBlocks() {
@@ -141,6 +184,7 @@ function boot() {
     $("editor").classList.remove("hidden");
     setupEditor();
     setStatus("加载中…");
+    loadMdLibs();          // 按需加载 Markdown 库，不阻塞内容显示
   }
   refreshAuthAndConfig();
 }
@@ -177,7 +221,7 @@ function showLoginScreen(msg) {
   if (msg) {
     const el = $("loginError");
     el.textContent = msg;
-    el.style.display = "";
+    el.classList.remove("hidden");
   }
   setupLogin();
 }
@@ -191,7 +235,7 @@ function setupLogin() {
   const showLoginError = (msg) => {
     const el = $("loginError");
     el.textContent = msg;
-    el.style.display = "";
+    el.classList.remove("hidden");
   };
 
   const doLogin = async () => {
