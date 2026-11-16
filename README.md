@@ -182,6 +182,9 @@ data/notes/<地址>/
 | GET | `/api/session` | 会话探测（需登录；只读校验，不刷新空闲计时，供前端轮询弹回登录页） |
 | GET | `/api/{slug}` | 读取笔记 `{slug, exists, content, files[], ttl_hours, plain}` |
 | PUT | `/api/{slug}` | 保存，body `{"content":"...","ttl_hours":24,"plain":false}` |
+| GET | `/api/{slug}/raw` | 纯文本读正文（curl 友好；不存在返回 404；响应头带 `X-Note-Ttl-Hours`/`X-Note-Plain`） |
+| PUT / POST | `/api/{slug}/raw` | 纯文本写正文：请求体即原文，可选 `?ttl=24\|72\|120\|168&plain=true\|false` |
+| PUT | `/{slug}` | 上条纯文本写的路径别名（`curl -T 1.txt http://host:8080/mynote`） |
 | POST | `/api/{slug}/upload` | multipart 上传，字段名 `file` |
 | DELETE | `/api/{slug}/file/{name}` | 删除附件 |
 | GET | `/api/{slug}/export` | 整包导出 zip |
@@ -197,6 +200,24 @@ data/notes/<地址>/
 除 `health`、`login` 外，启用密码后所有接口均需登录 Cookie。
 `ttl_hours` 仅接受 24 / 72 / 120 / 168；`plain` 与 `ttl_hours` 都可省略，省略 = 不修改。
 正文超过 `storage.max_note_mb` 返回 `413`。
+
+### 命令行（curl）读写笔记
+
+```bash
+B=http://127.0.0.1:9720
+# ---- 未启用密码时 ----
+cat 1.txt | curl -T - $B/api/mynote/raw    # 管道写入（cat 1.txt > sznote/mynote）
+curl -T 1.txt $B/mynote                    # 文件直传（/api/{slug}/raw 的路径别名）
+curl $B/api/mynote/raw                     # 读取正文
+curl -I $B/api/mynote/raw                  # 只看元信息（X-Note-Ttl-Hours / X-Note-Plain）
+# ---- 启用密码时：先登录拿 Cookie ----
+curl -s -c ck -d '{"password":"你的密码"}' $B/api/login
+curl -b ck -T 1.txt $B/api/mynote/raw
+curl -b ck $B/api/mynote/raw
+```
+
+说明：slug 必须是 6~64 位字母数字/连字符/下划线（历史 1~5 位地址仅在笔记已存在时可用）；
+写入可选 `?ttl=168`（7 天）、`?plain=true`（纯文本模式）；正文上限同 `storage.max_note_mb`。
 
 ## 开发
 

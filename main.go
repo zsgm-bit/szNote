@@ -618,27 +618,35 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 	}
 	writeMu.Lock()
 	defer writeMu.Unlock()
+	if err := persistNote(slug, []byte(body.Content), body.TTLHours, body.Plain); err != nil {
+		fail(w, http.StatusInternalServerError, "写入失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// persistNote 原子写入正文并按需更新 meta（调用方需已持有 writeMu）。
+// ttlHours/plain 任一非 nil 即合并写入 meta，避免覆盖另一项设置。
+func persistNote(slug string, content []byte, ttlHours *int, plain *bool) error {
+	c := cfg()
 	dir := noteDir(slug)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		fail(w, http.StatusInternalServerError, "无法创建笔记目录")
-		return
+		return err
 	}
 	tmp := notePath(slug) + ".tmp"
-	if err := os.WriteFile(tmp, []byte(body.Content), 0o600); err != nil {
-		fail(w, http.StatusInternalServerError, "写入失败")
-		return
+	if err := os.WriteFile(tmp, content, 0o600); err != nil {
+		return err
 	}
 	if err := os.Rename(tmp, notePath(slug)); err != nil {
-		fail(w, http.StatusInternalServerError, "写入失败")
-		return
+		return err
 	}
-	if body.TTLHours != nil || body.Plain != nil {
-		m, _ := loadMeta(slug) // 合并写入，避免覆盖另一项设置
-		if body.TTLHours != nil {
-			m.TTLHours = *body.TTLHours
+	if ttlHours != nil || plain != nil {
+		m, _ := loadMeta(slug)
+		if ttlHours != nil {
+			m.TTLHours = *ttlHours
 		}
-		if body.Plain != nil {
-			m.Plain = *body.Plain
+		if plain != nil {
+			m.Plain = *plain
 		}
 		if m.TTLHours == 0 { // 还没设过有效期：落成全局默认，避免 0 被当成无效值
 			m.TTLHours = int(c.ttl.Hours())
@@ -647,7 +655,80 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 			_ = os.WriteFile(metaPath(slug), mb, 0o600)
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	return nil
+}
+
+// GET /api/{slug}/raw —— 纯文本读正文，curl 友好：
+//
+//	curl http://host:8080/api/mynote/raw
+//
+// 笔记不存在返回 404；响应头带 X-Note-Ttl-Hours / X-Note-Plain 供脚本取元信息。
+func getNoteRaw(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	if !validSlug(slug) {
+		fail(w, http.StatusNotFound, "无效的笔记地址")
+		return
+	}
+	b, err := os.ReadFile(notePath(slug))
+	if err != nil {
+		fail(w, http.StatusNotFound, "笔记不存在")
+		return
+	}
+	touch(slug)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Note-Ttl-Hours", strconv.Itoa(int(ttlFor(slug).Hours())))
+	w.Header().Set("X-Note-Plain", strconv.FormatBool(plainFor(slug)))
+	w.Write(b)
+}
+
+// PUT|POST /api/{slug}/raw 与 PUT /{slug} —— 请求体即正文原文，无需 JSON 包装：
+//
+//	curl -T 1.txt http://host:8080/api/mynote/raw          # 上传文件
+//	cat 1.txt | curl -T - http://host:8080/api/mynote/raw  # 管道写入
+//	echo hi | curl --data-binary @- -X POST http://host:8080/api/mynote/raw
+//	curl -T 1.txt "http://host:8080/mynote?ttl=168"        # 路径别名 + 可选参数
+//
+// 可选查询参数：ttl=24|72|120|168（天×24）、plain=true|false；缺省 = 不修改
+//（新笔记沿用全局默认）。响应为 {"ok":true,"slug":...,"bytes":...}。
+func saveNoteRaw(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	if !validSlug(slug) {
+		fail(w, http.StatusNotFound, "无效的笔记地址")
+		return
+	}
+	c := cfg()
+	r.Body = http.MaxBytesReader(w, r.Body, c.maxNote+(1<<16))
+	content, err := io.ReadAll(r.Body)
+	if err != nil {
+		fail(w, http.StatusRequestEntityTooLarge,
+			fmt.Sprintf("正文超过上限（%d MB）", c.maxNote>>20))
+		return
+	}
+	var ttlHours *int
+	if q := r.URL.Query().Get("ttl"); q != "" {
+		t, err := strconv.Atoi(q)
+		if err != nil || !validTTL(t) {
+			fail(w, http.StatusBadRequest, "有效期只能是 1/3/5/7 天（24/72/120/168 小时）")
+			return
+		}
+		ttlHours = &t
+	}
+	var plain *bool
+	if q := r.URL.Query().Get("plain"); q != "" {
+		b, err := strconv.ParseBool(q)
+		if err != nil {
+			fail(w, http.StatusBadRequest, "plain 参数只能是 true 或 false")
+			return
+		}
+		plain = &b
+	}
+	writeMu.Lock()
+	defer writeMu.Unlock()
+	if err := persistNote(slug, content, ttlHours, plain); err != nil {
+		fail(w, http.StatusInternalServerError, "写入失败")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "slug": slug, "bytes": len(content)})
 }
 
 // blockedExts 禁止上传的主动内容格式（会在浏览器中执行脚本 / 可托管钓鱼页）
@@ -2258,6 +2339,13 @@ func main() {
 	})
 	mux.HandleFunc("GET /api/{slug}", requireAuth(getNote))
 	mux.HandleFunc("PUT /api/{slug}", requireAuth(saveNote))
+	// 纯文本 API（curl / Linux CLI 友好）：/api/{slug}/raw 读写正文，
+	// PUT /{slug} 为写入路径别名（读取不设 /{slug}/raw 别名——与 /static/ 子树路由冲突），
+	// 详见 getNoteRaw/saveNoteRaw 注释
+	mux.HandleFunc("GET /api/{slug}/raw", requireAuth(getNoteRaw))
+	mux.HandleFunc("PUT /api/{slug}/raw", requireAuth(saveNoteRaw))
+	mux.HandleFunc("POST /api/{slug}/raw", requireAuth(saveNoteRaw))
+	mux.HandleFunc("PUT /{slug}", requireAuth(saveNoteRaw))
 	mux.HandleFunc("POST /api/{slug}/upload", requireAuth(upload))
 	mux.HandleFunc("GET /api/{slug}/export", requireAuth(exportZip))
 	mux.HandleFunc("DELETE /api/{slug}/file/{name}", requireAuth(delFile))
