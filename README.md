@@ -3,6 +3,8 @@
 [![build](https://github.com/zsgm-bit/szNote/actions/workflows/build.yml/badge.svg)](https://github.com/zsgm-bit/szNote/actions/workflows/build.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+![szNote 适用场景](docs/scenarios.png)
+
 类 [note.ms](https://note.ms) 的自托管网页笔记服务：Go 前后端一体、单二进制、零第三方依赖。
 打开 `http://your-host:9720/任意地址` 就能写 Markdown、贴图、传文件，到期自动删除。
 
