@@ -180,11 +180,12 @@ jobs:
           # 分发物随附：许可文本（MIT 要求保留版权与许可声明）
           #              + 默认配置 config.json（解压即可改，程序只读这个文件名）
           #              + 配置模板 config.example.json（全字段中文注释）
-          #              + README.md（离线可查的使用文档）
+          #              + README.md（离线可查的使用文档）及其引用的 docs/ 头图
           cp LICENSE config.example.json README.md dist/
+          cp -r docs dist/docs
           cp config.default.json dist/config.json
           cd dist
-          FILES="LICENSE config.json config.example.json README.md"
+          FILES="LICENSE config.json config.example.json README.md docs"
           for f in sznote_*; do
             case "$f" in
               *.tar.gz|*.zip) continue ;;   # 已打包产物，跳过（保证重复执行幂等）
@@ -206,7 +207,7 @@ jobs:
           body: |
             szNote ${{ github.ref_name }}
 
-            **压缩包内含**：二进制 + `config.json`（默认配置，直接改这个）+ `config.example.json`（全字段注释模板）+ `README.md` + `LICENSE`
+            **压缩包内含**：二进制 + `config.json`（默认配置，直接改这个）+ `config.example.json`（全字段注释模板）+ `README.md`（含使用场景漫画，图在 `docs/`）+ `LICENSE`
 
             - 单二进制，无运行时依赖；解压即用
             - 首次运行：`./sznote -hash '你的密码'`，把输出整行填进 `config.json` 的 `server.password_hash`，再 `./sznote`
