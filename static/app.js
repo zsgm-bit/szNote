@@ -623,11 +623,14 @@ function applyTTL(hours) {
 async function save() {
   clearTimeout(saveTimer);
   try {
-    const ttl = parseInt($("ttlSelect").value, 10) || 0;
+    // ttl_hours 只在有合法值时携带（缺省 = 不修改，服务端把 0 当 400 拒掉）
+    const ttl = parseInt($("ttlSelect").value, 10);
+    const payload = { content: $("content").value, plain: plainMode };
+    if (TTL_DAYS.includes(ttl)) payload.ttl_hours = ttl;
     const r = await fetch("/api/" + encodeURIComponent(slug), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: $("content").value, ttl_hours: ttl, plain: plainMode }),
+      body: JSON.stringify(payload),
     });
     if (r.status === 401) {
       showLoginScreen("登录已超时，请重新登录");

@@ -19,6 +19,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -497,13 +498,16 @@ func safeName(name string) string {
 	return name
 }
 
-// touch 更新笔记的“最后使用时间”（以 note.md 的修改时间记账，重启不丢）
+// touch 更新笔记的“最后使用时间”：优先以 note.md 的修改时间记账（重启不丢）；
+// 没有正文的纯附件笔记退化为更新目录 mtime，保证与清理口径一致
 func touch(slug string) {
 	p := notePath(slug)
+	now := time.Now()
 	if _, err := os.Stat(p); err == nil {
-		now := time.Now()
 		_ = os.Chtimes(p, now, now)
+		return
 	}
+	_ = os.Chtimes(noteDir(slug), now, now)
 }
 
 // randSlug 生成随机短地址：rejection sampling 消除取模偏置（CWE-338/341）
@@ -601,7 +605,13 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 		Plain    *bool  `json:"plain"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-		fail(w, http.StatusRequestEntityTooLarge, "请求体无效或超过大小限制")
+		// 区分超限（413）与格式错误（400）：统一报 413 会误导用户以为是正文超限
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			fail(w, http.StatusRequestEntityTooLarge, "请求体超过大小限制")
+		} else {
+			fail(w, http.StatusBadRequest, "请求体 JSON 无效")
+		}
 		return
 	}
 	if int64(len(body.Content)) > c.maxNote {
@@ -796,9 +806,9 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 
-	// 单笔记总大小配额（防存储耗尽）
+	// 单笔记总大小配额（防存储耗尽）：预检用客户端声明快速拒绝，写完后按实际大小复核
+	var total int64
 	if c.maxNoteTotal > 0 {
-		var total int64
 		if entries, err := os.ReadDir(dir); err == nil {
 			for _, e := range entries {
 				if !e.IsDir() {
@@ -815,14 +825,20 @@ func upload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 同名文件自动追加序号：a.png -> a-1.png -> a-2.png
+	// 同名文件自动追加序号：a.png -> a-1.png -> a-2.png（上限 999，防恶意预占拖长循环）
 	final := name
-	for i := 1; ; i++ {
+	found := false
+	for i := 1; i <= 999; i++ {
 		if _, err := os.Stat(filepath.Join(dir, final)); os.IsNotExist(err) {
+			found = true
 			break
 		}
 		ext := filepath.Ext(name)
 		final = fmt.Sprintf("%s-%d%s", strings.TrimSuffix(name, ext), i, ext)
+	}
+	if !found { // 极端情况兜底：时间戳命名，保证一定能落盘
+		ext := filepath.Ext(name)
+		final = fmt.Sprintf("%s-%d%s", strings.TrimSuffix(name, ext), time.Now().UnixMilli(), ext)
 	}
 	dst, err := os.OpenFile(filepath.Join(dir, final), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
@@ -835,6 +851,17 @@ func upload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dst.Close()
+	// 配额复核：hdr.Size 是客户端自报的 multipart 声明、可伪造（报小写大），
+	// 以落盘实际大小为准，超限即删除刚写入的文件
+	if c.maxNoteTotal > 0 {
+		p := filepath.Join(dir, final)
+		if fi, err := os.Stat(p); err == nil && total+fi.Size() > c.maxNoteTotal {
+			_ = os.Remove(p)
+			fail(w, http.StatusRequestEntityTooLarge,
+				fmt.Sprintf("附件总大小超过上限（%d MB）", c.maxNoteTotal>>20))
+			return
+		}
+	}
 	touch(slug)
 
 	log.Printf("upload: /%s -> %s", slug, final)
@@ -1308,9 +1335,11 @@ func logout(w http.ResponseWriter, r *http.Request) {
 			sessMu.Unlock()
 		}
 	}
+	// Secure 跟随连接协议：纯 HTTP 部署下带 Secure 的清除 Cookie 会被浏览器拒收
 	http.SetCookie(w, &http.Cookie{
 		Name: sessionCookie, Value: "", Path: "/",
-		HttpOnly: true, Secure: true, SameSite: http.SameSiteStrictMode, MaxAge: -1,
+		HttpOnly: true, Secure: r.TLS != nil || strings.EqualFold(r.Header.Get("X-Forwarded-Proto"), "https"),
+		SameSite: http.SameSiteStrictMode, MaxAge: -1,
 	})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -1648,51 +1677,63 @@ func trChunk(w http.ResponseWriter, r *http.Request) {
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, c.trMaxFile-cur+1)
 
-	// 限速读取：小粒度读 + 全局桶 pacing，TCP 背压自然把发送端压到限额
-	var buf bytes.Buffer
-	tmp := make([]byte, trSubRead)
+	// 流式落盘：小粒度读 + 逐块 WriteAt，请求体不再整体攒在内存里
+	// （恶意客户端可直接 PUT 50MB，N 个并发请求就是 N×50MB 内存放大）。
+	// writeMu 只在单块 WriteAt 时短暂持有，不阻塞期间的其他写入操作。
+	// 限速读取：全局桶 pacing，TCP 背压自然把发送端压到限额
 	rc := http.NewResponseController(w)
+	writeMu.Lock()
+	f, ferr := os.OpenFile(trBinPath(m.Code), os.O_WRONLY, 0o600)
+	writeMu.Unlock()
+	if ferr != nil {
+		fail(w, http.StatusInternalServerError, "写入失败")
+		return
+	}
+	defer f.Close()
+	tmp := make([]byte, trSubRead)
+	var written int64
+	checkedPK := false
 	for {
 		if rate := float64(cfg().trUpKBPS) * 1024; rate > 0 {
 			upBucket.take(rate, trSubRead)
 		}
 		_ = rc.SetReadDeadline(time.Now().Add(2 * time.Minute)) // 每次读取续期，卡死连接 2 分钟内断开
-		n, err := r.Body.Read(tmp)
+		n, rerr := r.Body.Read(tmp)
 		if n > 0 {
-			buf.Write(tmp[:n])
+			if !checkedPK && cur == 0 {
+				checkedPK = true
+				if !bytes.HasPrefix(tmp[:n], []byte("PK")) {
+					fail(w, http.StatusUnsupportedMediaType, "文件内容不是有效的压缩包（缺少 PK 头）")
+					return
+				}
+			}
+			writeMu.Lock()
+			_, werr := f.WriteAt(tmp[:n], off+written)
+			writeMu.Unlock()
+			if werr != nil {
+				fail(w, http.StatusInternalServerError, "写入失败")
+				return
+			}
+			written += int64(n)
 		}
-		if err == io.EOF {
+		if rerr == io.EOF {
 			break
 		}
-		if err != nil {
+		if rerr != nil {
 			fail(w, http.StatusBadRequest, "读取数据失败")
 			return
 		}
 	}
-	if cur == 0 && !bytes.HasPrefix(buf.Bytes(), []byte("PK")) {
-		fail(w, http.StatusUnsupportedMediaType, "文件内容不是有效的压缩包（缺少 PK 头）")
-		return
-	}
 
 	writeMu.Lock()
-	f, err := os.OpenFile(trBinPath(m.Code), os.O_WRONLY, 0o600)
-	if err != nil {
-		writeMu.Unlock()
-		fail(w, http.StatusInternalServerError, "写入失败")
-		return
-	}
-	_, werr := f.WriteAt(buf.Bytes(), off)
-	f.Close()
-	if werr == nil {
-		m.Updated = time.Now().Unix()
-		werr = saveTrMeta(m)
-	}
+	m.Updated = time.Now().Unix()
+	werr := saveTrMeta(m)
 	writeMu.Unlock()
 	if werr != nil {
 		fail(w, http.StatusInternalServerError, "写入失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "offset": off + int64(buf.Len())})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "offset": off + written})
 }
 
 // POST /api/transfer/{code}/complete —— 结束发送：校验字节数后对外可见
@@ -1768,7 +1809,7 @@ func trManifest(w http.ResponseWriter, r *http.Request) {
 // GET /api/transfer/download?code=xxx —— 下载（ServeContent 提供 Range 断点续传，全局下行桶限速）
 func trDownload(w http.ResponseWriter, r *http.Request) {
 	m, ok := loadTrMeta(strings.TrimSpace(r.URL.Query().Get("code")))
-	if !ok || !m.Ready {
+	if !ok || !m.Ready || time.Now().Unix() > m.Expires { // 与 trList 同口径：过期不可下载
 		fail(w, http.StatusNotFound, "取件码不存在、未完成或已过期")
 		return
 	}
@@ -2091,8 +2132,9 @@ func cleanOnce() {
 		np := filepath.Join(dir, noteFile)
 		info, err := os.Stat(np)
 		if err != nil {
-			// 没有 note.md 的空壳目录：按目录自身 mtime 判断
-			if di, err2 := e.Info(); err2 == nil && time.Since(di.ModTime()) > cfg().ttl {
+			// 没有 note.md 的纯附件目录：按目录 mtime + 该笔记自身 meta 的 TTL 判断
+			// （与正文笔记同一口径，避免“先拖附件未存正文”的笔记提前被全局默认清掉）
+			if di, err2 := e.Info(); err2 == nil && time.Since(di.ModTime()) > ttlFor(slug) {
 				log.Printf("cleanup: removed empty dir %s", slug)
 				_ = os.RemoveAll(dir)
 			}
