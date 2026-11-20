@@ -369,6 +369,7 @@ code, .mono { font-family: var(--font-mono); }
   border-radius: 14px;
   background: #fff;
   box-shadow: 0 1px 2px rgba(16, 24, 40, .04);
+  --gutter-w: 46px;
 }
 #panes:focus-within { box-shadow: 0 0 0 2px rgba(79, 70, 229, .2); }
 #content {
@@ -376,7 +377,7 @@ code, .mono { font-family: var(--font-mono); }
   width: 50%;
   min-width: 0;
   min-height: 0;
-  padding: 22px 24px;
+  padding: 22px 24px 22px calc(24px + var(--gutter-w));
   resize: none;
   border: 0;
   border-radius: 0;
@@ -390,6 +391,26 @@ code, .mono { font-family: var(--font-mono); }
   tab-size: 2;
 }
 #content:focus { border: 0; box-shadow: inset -1px 0 0 #e5e8ef; background: #f7f9fc; }
+
+/* 行号列：视觉层绘制（不进正文），与 textarea 同步滚动；见 app.js setupGutter */
+#gutter {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--gutter-w);
+  height: 100%;
+  overflow: hidden;
+  z-index: 1;
+  pointer-events: none;
+  user-select: none;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: #9aa4b8;
+  will-change: transform;
+}
+#gutter .ln { padding-right: 10px; white-space: pre; }
+#panes.fullpreview #gutter { display: none; }
 #preview {
   flex: 1 1 0;
   width: 50%;
@@ -904,7 +925,8 @@ code, .mono { font-family: var(--font-mono); }
   .editor-body { flex-direction: column; padding: 10px; overflow-x: hidden; overflow-y: auto; }
   #panes { flex: none; flex-direction: column; width: 100%; overflow: hidden; }
   #panes.previewing:not(.fullpreview) #content { flex: none; }
-  #content { flex: none; width: 100%; height: 52dvh; min-height: 340px; padding: 20px; font-size: 16px; }
+  #panes { --gutter-w: 34px; }
+  #content { flex: none; width: 100%; height: 52dvh; min-height: 340px; padding: 20px; padding-left: calc(20px + var(--gutter-w)); font-size: 16px; }
   #preview { flex: none; width: 100%; min-height: 300px; max-height: 60dvh; overflow: auto; }
   .divider, .divider.v, #splitH { flex: 0 0 6px; width: 100%; height: 6px; cursor: default; touch-action: auto; }
   .divider::after, .divider.v::after, #splitH::after { width: 28px; height: 2px; }
@@ -934,7 +956,7 @@ code, .mono { font-family: var(--font-mono); }
   .ph-text { flex-basis: calc(100% - 76px); }
   #plainHint .mini { min-height: 36px; }
   .editor-body { padding: 8px; }
-  #content { min-height: 320px; padding: 17px; }
+  #content { min-height: 320px; padding: 17px; padding-left: calc(17px + var(--gutter-w)); }
   #preview { min-height: 260px; padding: 18px; }
   .modal-mask { align-items: flex-end; padding: 12px; }
   .modal { width: 100%; max-height: calc(100dvh - 24px); border-radius: 16px; }

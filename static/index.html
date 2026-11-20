@@ -102,6 +102,7 @@
   <div class="editor-body">
     <section id="panes" aria-label="笔记工作区">
 <!-- __BOOT__：服务端把已存在笔记的正文（HTML 转义后）替换到这里，首屏即见全文 -->
+      <div id="gutter" aria-hidden="true"></div>
       <textarea id="content" spellcheck="false" aria-label="笔记内容" placeholder="在这里输入 Markdown…&#10;&#10;支持直接 Ctrl+V 粘贴截图，或把文件拖进来。">__BOOT__</textarea>
       <div id="splitV" class="divider v" role="separator" tabindex="0" aria-label="调整编辑器与预览比例" aria-valuemin="10" aria-valuemax="95" aria-valuenow="50" title="拖动调整宽度"></div>
       <div id="preview" class="markdown hidden" aria-label="Markdown 预览"></div>

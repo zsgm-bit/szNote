@@ -448,6 +448,7 @@ function setupEditor() {
   });
 
   setupSplitters();
+  setupGutter(ta);
   applySavedWidths();
   setupSwap();
 
@@ -519,6 +520,78 @@ function updateFilesMini(w) {
   $("filesPanel").classList.toggle("mini", w < 88);
 }
 
+/* ---------- 编辑器行号：左侧 gutter，纯视觉层，不进正文 ----------
+ * textarea 软换行下逻辑行 ≠ 显示行：用隐藏镜像层（与编辑区同字体、同内容宽度）
+ * 实测每个逻辑行折行后的像素高度，行号按实测高度逐行排布；滚动时整列平移。
+ * 超长笔记（>8000 行）退化为按单行高度估排，避免每次输入全量镜像重排。 */
+function setupGutter(ta) {
+  const g = $("gutter");
+  const cs0 = getComputedStyle(ta);
+  const LH = parseFloat(cs0.lineHeight) || 24.5;
+  const mirror = document.createElement("div");
+  const ms = mirror.style;
+  ms.cssText = "position:absolute;left:-99999px;top:0;visibility:hidden;" +
+    "white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;";
+  document.body.appendChild(mirror);
+  const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  let timer = 0;
+  function measure() {
+    /* 编辑区不可见（全屏预览 / 未进入编辑页）时不绘制 */
+    if (!ta.offsetParent || getComputedStyle(ta).display === "none") {
+      g.style.display = "none";
+      return;
+    }
+    g.style.display = "";
+    const cs = getComputedStyle(ta);
+    ms.fontSize = cs.fontSize;
+    ms.fontFamily = cs.fontFamily;
+    ms.fontWeight = cs.fontWeight;
+    ms.lineHeight = cs.lineHeight;
+    ms.tabSize = cs.tabSize;
+    ms.letterSpacing = cs.letterSpacing;
+    const scrollW = ta.offsetWidth - ta.clientWidth;      // 竖向滚动条宽度
+    ms.width = (ta.clientWidth - scrollW -
+      parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)) + "px";
+    g.style.paddingTop = cs.paddingTop;                   // 与正文首行对齐
+    const lines = ta.value.split("\n");
+    /* 行高用 CSSOM 赋值（createElement + style.height）——页面 CSP 禁止
+       style 属性，innerHTML 拼 style="..." 会被整体丢弃 */
+    const frag = document.createDocumentFragment();
+    if (lines.length <= 8000) {
+      let html = "";
+      for (let i = 0; i < lines.length; i++) {
+        html += lines[i] ? "<div>" + esc(lines[i]) + "</div>" : "<div>\u200b</div>";
+      }
+      mirror.innerHTML = html;
+      const rows = mirror.children;
+      for (let i = 0; i < rows.length; i++) {
+        addRow(frag, i + 1, rows[i].offsetHeight || LH);
+      }
+    } else {
+      for (let i = 1; i <= lines.length; i++) addRow(frag, i, LH);
+    }
+    g.replaceChildren(frag);
+    sync();
+  }
+  function addRow(frag, num, h) {
+    const d = document.createElement("div");
+    d.className = "ln";
+    d.style.height = h + "px";
+    d.style.lineHeight = LH + "px";
+    d.textContent = num;
+    frag.appendChild(d);
+  }
+  function sync() { g.style.transform = "translateY(" + -ta.scrollTop + "px)"; }
+  function schedule() { clearTimeout(timer); timer = setTimeout(measure, 120); }
+
+  ta.addEventListener("input", schedule);
+  ta.addEventListener("scroll", sync, { passive: true });
+  new ResizeObserver(schedule).observe(ta);
+  ta.__gutter = schedule;      // load() 等直接赋值 ta.value 的路径调用它重排
+  measure();
+}
+
 async function load() {
   const r = await fetch("/api/" + encodeURIComponent(slug));
   if (r.status === 401) {  // 会话过期 → 回到登录页
@@ -528,6 +601,7 @@ async function load() {
   try {
     const d = await r.json();
     if (d.exists) $("content").value = d.content;
+    if ($("content").__gutter) $("content").__gutter();   // 行号列随内容重排
     setPlain(!!d.plain, false);
     renderFiles(d.files || []);
     setStatus(d.exists ? "已加载" : "新笔记，首次保存后生效");
