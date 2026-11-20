@@ -1643,13 +1643,30 @@ func trInit(w http.ResponseWriter, r *http.Request) {
 }
 
 // PUT /api/transfer/{code}/chunk?offset=N —— 追加一块数据（限速读取，全局上行桶）
+//
+// trCodeLocks：每个取件码一把锁。同一 code 的「读进度 → 判 offset → 流式写 → 记 meta」
+// 全程串行——否则发送端重试的旧请求与续传的新请求可同时通过 off==cur 判定，
+// 交错 WriteAt 把同一偏移区间覆写撕裂（complete 的总字节数校验发现不了内容错乱）。
+// 慢发送端最长占用 2 分钟（读超时），只影响自己这个 code。
+var trCodeLocks sync.Map // code -> *sync.Mutex
+
+func trCodeLock(code string) *sync.Mutex {
+	v, _ := trCodeLocks.LoadOrStore(code, &sync.Mutex{})
+	return v.(*sync.Mutex)
+}
+
 func trChunk(w http.ResponseWriter, r *http.Request) {
 	c := cfg()
 	if !c.transferEnabled {
 		fail(w, http.StatusForbidden, "文件互传未启用")
 		return
 	}
-	m, ok := loadTrMeta(r.PathValue("code"))
+	code := r.PathValue("code")
+	mu := trCodeLock(code)
+	mu.Lock()
+	defer mu.Unlock()
+	// 锁内重读 meta：complete/delete 可能刚持有同一把锁改过状态
+	m, ok := loadTrMeta(code)
 	if !ok || m.Ready {
 		fail(w, http.StatusNotFound, "取件码不存在或已完成传输")
 		return
@@ -1692,7 +1709,37 @@ func trChunk(w http.ResponseWriter, r *http.Request) {
 	defer f.Close()
 	tmp := make([]byte, trSubRead)
 	var written int64
-	checkedPK := false
+
+	// PK 魔数校验：先聚齐前 2 字节（网络分片可能让首个 Read 只返回 1 字节），
+	// 校验通过后把这 2 字节一并落盘，主循环从 written 处续写
+	if cur == 0 {
+		var pk [2]byte
+		got := 0
+		for got < 2 {
+			if rate := float64(cfg().trUpKBPS) * 1024; rate > 0 {
+				upBucket.take(rate, trSubRead)
+			}
+			_ = rc.SetReadDeadline(time.Now().Add(2 * time.Minute))
+			n, rerr := r.Body.Read(pk[got:])
+			got += n
+			if rerr != nil {
+				break // EOF（体不足 2 字节）或读错误：PK 判定自然拒绝
+			}
+		}
+		if !bytes.HasPrefix(pk[:got], []byte("PK")) {
+			fail(w, http.StatusUnsupportedMediaType, "文件内容不是有效的压缩包（缺少 PK 头）")
+			return
+		}
+		writeMu.Lock()
+		_, werr := f.WriteAt(pk[:got], off)
+		writeMu.Unlock()
+		if werr != nil {
+			fail(w, http.StatusInternalServerError, "写入失败")
+			return
+		}
+		written = int64(got)
+	}
+
 	for {
 		if rate := float64(cfg().trUpKBPS) * 1024; rate > 0 {
 			upBucket.take(rate, trSubRead)
@@ -1700,13 +1747,6 @@ func trChunk(w http.ResponseWriter, r *http.Request) {
 		_ = rc.SetReadDeadline(time.Now().Add(2 * time.Minute)) // 每次读取续期，卡死连接 2 分钟内断开
 		n, rerr := r.Body.Read(tmp)
 		if n > 0 {
-			if !checkedPK && cur == 0 {
-				checkedPK = true
-				if !bytes.HasPrefix(tmp[:n], []byte("PK")) {
-					fail(w, http.StatusUnsupportedMediaType, "文件内容不是有效的压缩包（缺少 PK 头）")
-					return
-				}
-			}
 			writeMu.Lock()
 			_, werr := f.WriteAt(tmp[:n], off+written)
 			writeMu.Unlock()
@@ -1743,7 +1783,12 @@ func trComplete(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusForbidden, "文件互传未启用")
 		return
 	}
-	m, ok := loadTrMeta(r.PathValue("code"))
+	code := r.PathValue("code")
+	// 与 trChunk 同一把 per-code 锁：流式写未结束时不允许翻转 Ready
+	mu := trCodeLock(code)
+	mu.Lock()
+	defer mu.Unlock()
+	m, ok := loadTrMeta(code)
 	if !ok || m.Ready {
 		fail(w, http.StatusNotFound, "取件码不存在或已完成传输")
 		return
@@ -1833,6 +1878,11 @@ func trDownload(w http.ResponseWriter, r *http.Request) {
 // DELETE /api/transfer/{code} —— 撤回一个中转文件
 func trDelete(w http.ResponseWriter, r *http.Request) {
 	code := r.PathValue("code")
+	// 与 trChunk 同一把 per-code 锁：流式写进行中不允许删除（Windows 下
+	// 打开中的 fd 还会让 RemoveAll 失败）；锁序 per-code → writeMu 与其他入口一致
+	mu := trCodeLock(code)
+	mu.Lock()
+	defer mu.Unlock()
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	_, ok := loadTrMeta(code)
@@ -1842,6 +1892,7 @@ func trDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = os.Remove(trBinPath(code))
 	_ = os.Remove(trMetaPath(code))
+	trCodeLocks.Delete(code) // 释放 per-code 锁条目，防 map 随 code 数量无界增长
 	log.Printf("transfer: deleted %s (by user)", code)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
@@ -1877,6 +1928,7 @@ func cleanTransfers() {
 			_ = os.Remove(trBinPath(m.Code))
 			_ = os.Remove(trMetaPath(m.Code))
 			writeMu.Unlock()
+			trCodeLocks.Delete(m.Code) // 释放 per-code 锁条目（正在等锁的请求会在锁内重读 meta 时 404）
 			reason := "expired"
 			if stale {
 				reason = "stale partial"
