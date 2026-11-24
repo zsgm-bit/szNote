@@ -604,7 +604,8 @@ func getNote(w http.ResponseWriter, r *http.Request) {
 		"pwd":       protected,
 	}
 	if protected {
-		resp["ntok"] = noteAttachToken(slug) // 给预览 <img>/文件列表下载链接用
+		m, _ := loadMeta(slug)
+		resp["ntok"] = noteAttachToken(slug, m.PwdHash) // 给预览 <img>/文件列表下载链接用
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -1101,9 +1102,10 @@ func serveFile(w http.ResponseWriter, r *http.Request) {
 	}
 	// 受保护笔记：附件访问同样需要密码（评审 P1-1）。
 	// <img>/下载链接无法携带自定义请求头，允许 ?ntok= 短时令牌（解锁后经
-	// getNote 或 /api/{slug}/ntok 签发，HMAC 绑定 slug+过期时间，防跨笔记重放）。
-	if noteProtected(slug) {
-		if !checkNoteToken(slug, r.URL.Query().Get("ntok")) {
+	// getNote 或 /api/{slug}/ntok 签发，HMAC 绑定 slug+当前密码哈希+过期时间，
+	// 防跨笔记重放；改密后旧令牌立即作废）。
+	if m, _ := loadMeta(slug); m.PwdHash != "" {
+		if !checkNoteToken(slug, m.PwdHash, r.URL.Query().Get("ntok")) {
 			if _, _, ok := noteAuth(w, r, slug); !ok {
 				return // noteAuth 已写好 401/429
 			}
@@ -1392,16 +1394,18 @@ func decryptBody(password string, blob []byte) ([]byte, error) {
 // 受保护笔记解锁后的页面改用 HMAC 令牌访问附件（绑定 slug + 过期时间）
 const noteTokTTL = 15 * time.Minute
 
-// noteAttachToken 签发附件短时令牌 "exp_hex.hmac_hex"，HMAC(authSecret, "ntok|slug|exp")
-func noteAttachToken(slug string) string {
+// noteAttachToken 签发附件短时令牌 "exp_hex.hmac_hex"，HMAC(authSecret, "ntok|slug|pwdHash|exp")。
+// HMAC 消息掺入当前密码哈希：set/remove 密码后哈希变化，旧令牌立即全部作废
+// （不依赖 15 分钟自然过期），避免换锁/共享电脑场景的残留窗口。
+func noteAttachToken(slug, pwdHash string) string {
 	exp := time.Now().Add(noteTokTTL).Unix()
 	mac := hmac.New(sha256.New, authSecret)
-	fmt.Fprintf(mac, "ntok|%s|%d", slug, exp)
+	fmt.Fprintf(mac, "ntok|%s|%s|%d", slug, pwdHash, exp)
 	return fmt.Sprintf("%x.%x", exp, mac.Sum(nil))
 }
 
-// checkNoteToken 校验附件短时令牌：未过期且 MAC 与 slug 匹配
-func checkNoteToken(slug, tok string) bool {
+// checkNoteToken 校验附件短时令牌：未过期且 MAC 与 slug+当前密码哈希匹配
+func checkNoteToken(slug, pwdHash, tok string) bool {
 	if tok == "" {
 		return false
 	}
@@ -1414,7 +1418,7 @@ func checkNoteToken(slug, tok string) bool {
 		return false
 	}
 	mac := hmac.New(sha256.New, authSecret)
-	fmt.Fprintf(mac, "ntok|%s|%d", slug, exp)
+	fmt.Fprintf(mac, "ntok|%s|%s|%d", slug, pwdHash, exp)
 	got, err := hex.DecodeString(tok[i+1:])
 	if err != nil || len(got) != mac.Size() {
 		return false
@@ -1839,7 +1843,8 @@ func noteToken(w http.ResponseWriter, r *http.Request) {
 	}
 	tok := ""
 	if protected {
-		tok = noteAttachToken(slug)
+		m, _ := loadMeta(slug)
+		tok = noteAttachToken(slug, m.PwdHash)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ntok": tok})
 }

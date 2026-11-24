@@ -28,18 +28,39 @@ const pwdHeader = () => notePwd ? { "X-Note-Password": notePwd } : {};
    解锁后由 getNote / /api/{slug}/ntok 签发 HMAC 令牌（15 分钟有效），访问 /f/ 附件时附带 */
 let noteNtok = "";
 let noteNtokAt = 0;
+let ntokInflight = null;
+let ntokGen = 0;
 async function ensureNtok(force = false) {
   if (!noteHasPwd) return "";
+  /* 没有密码（未解锁）时不请求：/ntok 会 401 并计入服务端防爆破失败计数 */
+  if (!notePwd) return noteNtok;
+  /* 9 分钟缓存（令牌有效期 15 分钟），到期自动续签；
+     force 用于改密后立即换新（服务端按密码哈希作废旧令牌） */
   if (!force && noteNtok && Date.now() - noteNtokAt < 9 * 60 * 1000) return noteNtok;
-  try {
-    const r = await fetch("/api/" + encodeURIComponent(slug) + "/ntok", { headers: pwdHeader() });
-    if (r.ok) { const d = await r.json(); noteNtok = d.ntok || ""; noteNtokAt = Date.now(); }
-  } catch { /* 网络失败沿用旧令牌 */ }
+  if (!force && ntokInflight) return ntokInflight;
+  const gen = ++ntokGen; // force 时作废在途旧请求的写入权，防旧令牌回填
+  ntokInflight = (async () => {
+    try {
+      const r = await fetch("/api/" + encodeURIComponent(slug) + "/ntok", { headers: pwdHeader() });
+      if (r.ok) {
+        const d = await r.json();
+        if (gen === ntokGen && d.ntok) { noteNtok = d.ntok; noteNtokAt = Date.now(); }
+      }
+    } catch { /* 网络失败沿用旧令牌 */ }
+    ntokInflight = null;
+  })();
+  await ntokInflight;
   return noteNtok;
 }
 function tokUrl(u) {
   if (!noteHasPwd || !noteNtok || !u || !u.startsWith("/f/")) return u;
-  return u + (u.includes("?") ? "&" : "?") + "ntok=" + encodeURIComponent(noteNtok);
+  /* 先剥掉已有的 ntok 再拼当前值：重复 render/rewrite 时 URL 可能已带旧参数，
+     而服务端 Query().Get("ntok") 取第一个，不剥会永远用最旧的令牌 */
+  const i = u.indexOf("?");
+  const base = i < 0 ? u : u.slice(0, i);
+  const qs = new URLSearchParams(i < 0 ? "" : u.slice(i + 1));
+  qs.set("ntok", noteNtok);
+  return base + "?" + qs.toString();
 }
 /* 预览区附件链接改写（Markdown 里的 ![](/f/...) 与下载链接） */
 function rewriteAttachUrls(root) {
@@ -141,7 +162,7 @@ const PURIFY_CFG = {
   ALLOW_DATA_ATTR: false,
 };
 
-function render() {
+async function render() {
   const src = $("content").value;
   const preview = $("preview");
   /* 纯文本模式，或 Markdown 库还没下载完：按原文显示
@@ -155,6 +176,8 @@ function render() {
     preview.appendChild(pre);
     return;
   }
+  /* 受保护笔记：令牌临近过期时自动续签，避免长编辑会话（>15 分钟）附件全 401 */
+  await ensureNtok();
   const html = marked.parse(src, { gfm: true, breaks: true });
   preview.innerHTML = DOMPurify.sanitize(html, PURIFY_CFG);
   rewriteAttachUrls(preview);
@@ -450,6 +473,7 @@ function setupEditor() {
     /* 只加载本站附件与 data: 图片，外链图片不请求 */
     const safeImg = hit && (hit.url.startsWith("/f/") || hit.url.startsWith("data:image/"));
     if (hit && safeImg) {
+      if (notePwd) ensureNtok(); // 令牌快过期时后台续签，本次渲染先用现有令牌
       const showUrl = tokUrl(hit.url);
       if (hoverImg.getAttribute("src") !== showUrl) {
         hoverImg.src = showUrl;
@@ -867,6 +891,8 @@ function setupPwdModal() {
       $("pwdOld").value = "";
       updateLockBtn();
       closePwdModal();
+      await ensureNtok(true); // 服务端已按新密码哈希作废旧令牌，立即换新
+      render();
       setStatus("已保存 " + new Date().toLocaleTimeString());
       toast("已为该笔记设置密码，正文加密落盘");
     } else {
@@ -886,6 +912,7 @@ function setupPwdModal() {
     if (r.ok && d.ok) {
       storePwd("");
       noteHasPwd = false;
+      noteNtok = ""; // 密码已移除，令牌全部作废
       $("pwdOld").value = "";
       updateLockBtn();
       closePwdModal();
@@ -899,6 +926,7 @@ function setupPwdModal() {
 
 async function refreshFiles() {
   try {
+    await ensureNtok(); // 文件列表的 <img>/下载链接依赖令牌，过期前先续签
     const r = await fetch("/api/" + encodeURIComponent(slug));
     const d = await r.json();
     renderFiles(d.files || []);
