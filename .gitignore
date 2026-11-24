@@ -8,3 +8,6 @@ quicknote.exe
 *.exe
 *.log
 .DS_Store
+*.bak_*
+deploy/
+config.json

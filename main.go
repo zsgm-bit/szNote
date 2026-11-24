@@ -19,6 +19,7 @@ import (
 	"crypto/sha256"
 	"crypto/subtle"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -593,7 +594,7 @@ func getNote(w http.ResponseWriter, r *http.Request) {
 		touch(slug)
 	}
 	ttlHours := int(ttlFor(slug).Hours())
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"slug":      slug,
 		"exists":    exists,
 		"content":   content,
@@ -601,7 +602,11 @@ func getNote(w http.ResponseWriter, r *http.Request) {
 		"ttl_hours": ttlHours,
 		"plain":     plainFor(slug),
 		"pwd":       protected,
-	})
+	}
+	if protected {
+		resp["ntok"] = noteAttachToken(slug) // 给预览 <img>/文件列表下载链接用
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // PUT /api/{slug} —— 保存笔记正文 {"content": "...", "ttl_hours": 24, "plain": false}
@@ -613,7 +618,7 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "无效的笔记地址")
 		return
 	}
-	password, protected, ok := noteAuth(w, r, slug)
+	password, _, ok := noteAuth(w, r, slug)
 	if !ok {
 		return
 	}
@@ -651,14 +656,18 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	content := []byte(body.Content)
-	if protected {
-		enc, eerr := prepareBodyForWrite(slug, password, content)
-		if eerr != nil {
+	// 锁内无条件重查保护状态与密码有效性（prepareBodyForWrite 内部重读 meta，评审 P2-3）
+	enc, eerr := prepareBodyForWrite(slug, password, content)
+	if eerr != nil {
+		if errors.Is(eerr, errNotePwdChanged) {
+			fail(w, http.StatusConflict, "笔记密码已变更，请刷新后重新解锁")
+		} else {
+			log.Printf("note /%s: encrypt failed: %v", slug, eerr)
 			fail(w, http.StatusInternalServerError, "正文加密失败")
-			return
 		}
-		content = enc
+		return
 	}
+	content = enc
 	if err := persistNote(slug, content, body.TTLHours, body.Plain); err != nil {
 		fail(w, http.StatusInternalServerError, "写入失败")
 		return
@@ -692,11 +701,28 @@ func persistNote(slug string, content []byte, ttlHours *int, plain *bool) error 
 		if m.TTLHours == 0 { // 还没设过有效期：落成全局默认，避免 0 被当成无效值
 			m.TTLHours = int(c.ttl.Hours())
 		}
-		if mb, err := json.Marshal(m); err == nil {
-			_ = os.WriteFile(metaPath(slug), mb, 0o600)
+		if mb, err := json.Marshal(m); err != nil {
+			log.Printf("note /%s: meta marshal failed (body ok): %v", slug, err)
+		} else if err := os.WriteFile(metaPath(slug), mb, 0o600); err != nil {
+			log.Printf("note /%s: meta update failed (body ok): %v", slug, err)
 		}
 	}
 	return nil
+}
+
+// writeFileSync 写文件并 fsync 落盘（供密码切换的事务化写入用，减小崩溃窗口）
+func writeFileSync(name string, data []byte) error {
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(data); err == nil {
+		err = f.Sync()
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	return err
 }
 
 // GET /api/{slug}/raw —— 纯文本读正文，curl 友好：
@@ -752,7 +778,7 @@ func saveNoteRaw(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "无效的笔记地址")
 		return
 	}
-	password, protected, ok := noteAuth(w, r, slug)
+	password, _, ok := noteAuth(w, r, slug)
 	if !ok {
 		return
 	}
@@ -784,14 +810,18 @@ func saveNoteRaw(w http.ResponseWriter, r *http.Request) {
 	}
 	writeMu.Lock()
 	defer writeMu.Unlock()
-	if protected {
-		enc, eerr := prepareBodyForWrite(slug, password, content)
-		if eerr != nil {
+	// 锁内无条件重查保护状态与密码有效性（prepareBodyForWrite 内部重读 meta，评审 P2-3）
+	enc, eerr := prepareBodyForWrite(slug, password, content)
+	if eerr != nil {
+		if errors.Is(eerr, errNotePwdChanged) {
+			fail(w, http.StatusConflict, "笔记密码已变更，请刷新后重新解锁")
+		} else {
+			log.Printf("note /%s: encrypt failed: %v", slug, eerr)
 			fail(w, http.StatusInternalServerError, "正文加密失败")
-			return
 		}
-		content = enc
+		return
 	}
+	content = enc
 	if err := persistNote(slug, content, ttlHours, plain); err != nil {
 		fail(w, http.StatusInternalServerError, "写入失败")
 		return
@@ -812,6 +842,10 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	if !validSlug(slug) {
 		fail(w, http.StatusNotFound, "无效的笔记地址")
+		return
+	}
+	// 受保护笔记：附件管理同样需要密码（评审 P1-1，附件本体仍不加密）
+	if _, _, ok := noteAuth(w, r, slug); !ok {
 		return
 	}
 	c := cfg()
@@ -937,6 +971,10 @@ func delFile(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusNotFound, "无效的笔记地址")
 		return
 	}
+	// 受保护笔记：附件管理同样需要密码（评审 P1-1）
+	if _, _, ok := noteAuth(w, r, slug); !ok {
+		return
+	}
 	writeMu.Lock()
 	defer writeMu.Unlock()
 	if err := os.Remove(filepath.Join(noteDir(slug), filesDir, name)); err != nil {
@@ -1060,6 +1098,16 @@ func serveFile(w http.ResponseWriter, r *http.Request) {
 	if !validSlug(slug) {
 		http.NotFound(w, r)
 		return
+	}
+	// 受保护笔记：附件访问同样需要密码（评审 P1-1）。
+	// <img>/下载链接无法携带自定义请求头，允许 ?ntok= 短时令牌（解锁后经
+	// getNote 或 /api/{slug}/ntok 签发，HMAC 绑定 slug+过期时间，防跨笔记重放）。
+	if noteProtected(slug) {
+		if !checkNoteToken(slug, r.URL.Query().Get("ntok")) {
+			if _, _, ok := noteAuth(w, r, slug); !ok {
+				return // noteAuth 已写好 401/429
+			}
+		}
 	}
 	p := filepath.Join(noteDir(slug), filesDir, name)
 	info, err := os.Stat(p)
@@ -1212,9 +1260,10 @@ func verifyHash(password, stored string) bool {
 
 // ---------- 单笔记密码（可选） ----------
 //
-// meta.json 里存 PwdHash（PBKDF2 验证哈希），正文以 AES-256-CBC 密文 blob 落盘——
-// 磁盘泄露场景下受保护笔记的正文不可读。同一 PBKDF2 派生 64 字节：
-// 前 32 字节作验证哈希存 meta，后 32 字节作 AES 密钥（不落盘），单次派生双用途。
+// meta.json 里存 PwdHash（PBKDF2 验证哈希），正文以 AES-256-GCM 密文 blob 落盘——
+// 磁盘泄露场景下受保护笔记的正文不可读，且认证标签保证密文不可被位翻转篡改（评审 P2-1）。
+// 同一 PBKDF2 派生 64 字节：前 32 字节作验证哈希存 meta，后 32 字节作 AES 密钥（不落盘），
+// 单次派生双用途。旧版 AES-256-CBC blob 仍可解（decryptBody 兼容读取，新写入一律 GCM）。
 // 注意：密码经请求头明文传输（与登录同级别），公网部署需 HTTPS。
 
 // deriveNoteKeys 从密码+盐派生 [验证哈希, AES 密钥] 各 32 字节
@@ -1233,11 +1282,12 @@ func newPwdHash(password string) (hash string, err error) {
 	return fmt.Sprintf("pbkdf2$%d$%s$%s", pbkdf2Iterations, hex.EncodeToString(salt), hex.EncodeToString(vb)), nil
 }
 
-// encBlob 受保护笔记 note.md 的落盘格式（自包含：盐/IV 随内容走）
+// encBlob 受保护笔记 note.md 的落盘格式（自包含：盐/nonce 随内容走）。
+// GCM 新格式：salt/iv/data 走 base64（避免 hex 让密文体积翻倍）；旧 CBC 格式：hex。
 type encBlob struct {
-	Enc  string `json:"enc"` // 固定 "aes-256-cbc"
+	Enc  string `json:"enc"` // "aes-256-gcm"（新）/ "aes-256-cbc"（旧，只读）
 	Salt string `json:"salt"`
-	IV   string `json:"iv"`
+	IV   string `json:"iv"` // GCM 为 12 字节 nonce
 	Data string `json:"data"`
 }
 
@@ -1262,14 +1312,16 @@ func pkcs7Unpad(b []byte, bs int) ([]byte, error) {
 	return b[:len(b)-n], nil
 }
 
-// encryptBody 用密码加密正文，返回可直接落盘的 blob JSON
+// encryptBody 用密码加密正文，返回可直接落盘的 blob JSON。
+// AES-256-GCM：认证标签使密文不可被位翻转篡改（评审 P2-1）；
+// base64 编码替代 hex，5MB 正文落盘体积约 6.7MB 而非 10.5MB（评审 P3）。
 func encryptBody(password string, plain []byte) ([]byte, error) {
 	salt := make([]byte, 16)
 	if _, err := rand.Read(salt); err != nil {
 		return nil, err
 	}
-	iv := make([]byte, 16)
-	if _, err := rand.Read(iv); err != nil {
+	nonce := make([]byte, 12)
+	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
 	_, key := deriveNoteKeys(password, salt)
@@ -1277,37 +1329,97 @@ func encryptBody(password string, plain []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	data := pkcs7Pad(plain, blk.BlockSize())
-	ct := make([]byte, len(data))
-	cipher.NewCBCEncrypter(blk, iv).CryptBlocks(ct, data)
+	gcm, err := cipher.NewGCM(blk)
+	if err != nil {
+		return nil, err
+	}
+	ct := gcm.Seal(nil, nonce, plain, nil)
 	return json.Marshal(encBlob{
-		Enc:  "aes-256-cbc",
-		Salt: hex.EncodeToString(salt),
-		IV:   hex.EncodeToString(iv),
-		Data: hex.EncodeToString(ct),
+		Enc:  "aes-256-gcm",
+		Salt: base64.StdEncoding.EncodeToString(salt),
+		IV:   base64.StdEncoding.EncodeToString(nonce),
+		Data: base64.StdEncoding.EncodeToString(ct),
 	})
 }
 
-// decryptBody 解密落盘 blob，返回正文明文
+// decryptBody 解密落盘 blob，返回正文明文。GCM 认证失败即报错——
+// 密文被篡改不可能静默解出错误内容；旧版 AES-256-CBC 兼容读取。
 func decryptBody(password string, blob []byte) ([]byte, error) {
 	var e encBlob
-	if err := json.Unmarshal(blob, &e); err != nil || e.Enc != "aes-256-cbc" {
+	if err := json.Unmarshal(blob, &e); err != nil {
 		return nil, errors.New("不是受保护笔记的正文格式")
 	}
-	salt, err1 := hex.DecodeString(e.Salt)
-	iv, err2 := hex.DecodeString(e.IV)
-	ct, err3 := hex.DecodeString(e.Data)
-	if err1 != nil || err2 != nil || err3 != nil || len(salt) < 8 || len(iv) != 16 || len(ct) == 0 {
-		return nil, errors.New("加密数据无效")
+	switch e.Enc {
+	case "aes-256-gcm":
+		salt, err1 := base64.StdEncoding.DecodeString(e.Salt)
+		nonce, err2 := base64.StdEncoding.DecodeString(e.IV)
+		ct, err3 := base64.StdEncoding.DecodeString(e.Data)
+		if err1 != nil || err2 != nil || err3 != nil ||
+			len(salt) < 8 || len(nonce) != 12 || len(ct) < 16 {
+			return nil, errors.New("加密数据无效")
+		}
+		_, key := deriveNoteKeys(password, salt)
+		blk, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		gcm, err := cipher.NewGCM(blk)
+		if err != nil {
+			return nil, err
+		}
+		return gcm.Open(nil, nonce, ct, nil)
+	case "aes-256-cbc": // 旧格式兼容读取（hex 编码）
+		salt, err1 := hex.DecodeString(e.Salt)
+		iv, err2 := hex.DecodeString(e.IV)
+		ct, err3 := hex.DecodeString(e.Data)
+		if err1 != nil || err2 != nil || err3 != nil || len(salt) < 8 || len(iv) != 16 || len(ct) == 0 {
+			return nil, errors.New("加密数据无效")
+		}
+		_, key := deriveNoteKeys(password, salt)
+		blk, err := aes.NewCipher(key)
+		if err != nil {
+			return nil, err
+		}
+		pt := make([]byte, len(ct))
+		cipher.NewCBCDecrypter(blk, iv).CryptBlocks(pt, ct)
+		return pkcs7Unpad(pt, blk.BlockSize())
+	default:
+		return nil, errors.New("不是受保护笔记的正文格式")
 	}
-	_, key := deriveNoteKeys(password, salt)
-	blk, err := aes.NewCipher(key)
-	if err != nil {
-		return nil, err
+}
+
+// noteTokTTL 附件短时令牌有效期：<img>/下载链接无法携带自定义请求头，
+// 受保护笔记解锁后的页面改用 HMAC 令牌访问附件（绑定 slug + 过期时间）
+const noteTokTTL = 15 * time.Minute
+
+// noteAttachToken 签发附件短时令牌 "exp_hex.hmac_hex"，HMAC(authSecret, "ntok|slug|exp")
+func noteAttachToken(slug string) string {
+	exp := time.Now().Add(noteTokTTL).Unix()
+	mac := hmac.New(sha256.New, authSecret)
+	fmt.Fprintf(mac, "ntok|%s|%d", slug, exp)
+	return fmt.Sprintf("%x.%x", exp, mac.Sum(nil))
+}
+
+// checkNoteToken 校验附件短时令牌：未过期且 MAC 与 slug 匹配
+func checkNoteToken(slug, tok string) bool {
+	if tok == "" {
+		return false
 	}
-	pt := make([]byte, len(ct))
-	cipher.NewCBCDecrypter(blk, iv).CryptBlocks(pt, ct)
-	return pkcs7Unpad(pt, blk.BlockSize())
+	i := strings.IndexByte(tok, '.')
+	if i <= 0 {
+		return false
+	}
+	exp, err := strconv.ParseInt(tok[:i], 16, 64)
+	if err != nil || time.Now().Unix() > exp {
+		return false
+	}
+	mac := hmac.New(sha256.New, authSecret)
+	fmt.Fprintf(mac, "ntok|%s|%d", slug, exp)
+	got, err := hex.DecodeString(tok[i+1:])
+	if err != nil || len(got) != mac.Size() {
+		return false
+	}
+	return subtle.ConstantTimeCompare(mac.Sum(nil), got) == 1
 }
 
 // noteAuth 单笔记密码校验：受保护笔记要求请求头 X-Note-Password。
@@ -1334,21 +1446,26 @@ func noteAuth(w http.ResponseWriter, r *http.Request, slug string) (password str
 		})
 		return "", true, false
 	}
+	clearLoginFails(ip) // 密码验证成功即重置失败计数（与登录一致）
 	return pw, true, true
 }
 
-// prepareBodyForWrite 写入前处理：受保护笔记把明文正文加密成 blob（调用方需已通过 noteAuth）。
+// errNotePwdChanged 鉴权通过后、拿锁前密码被并发修改（换/删密码竞态），调用方应让客户端重新解锁
+var errNotePwdChanged = errors.New("笔记密码已变更")
+
+// prepareBodyForWrite 写入前处理（必须在 writeMu 锁内调用）：锁内重读 meta 判定保护状态，
+// 受保护则校验 password 仍与当前哈希匹配——防止「鉴权时未设密码、拿锁前他人设了密码」
+// 竞态导致明文落盘，或「他人换了密码」导致用旧密钥加密出永久解不开的数据（评审 P2-3）。
 // 加密失败返回错误，调用方应拒绝写入——绝不能静默降级成明文落盘。
 func prepareBodyForWrite(slug, password string, content []byte) ([]byte, error) {
-	if !noteProtected(slug) {
+	m, _ := loadMeta(slug)
+	if m.PwdHash == "" {
 		return content, nil
 	}
-	enc, err := encryptBody(password, content)
-	if err != nil {
-		log.Printf("note /%s: encrypt failed: %v", slug, err)
-		return nil, err
+	if !verifyHash(password, m.PwdHash) {
+		return nil, errNotePwdChanged
 	}
-	return enc, nil
+	return encryptBody(password, content)
 }
 
 func noteProtected(slug string) bool {
@@ -1575,9 +1692,11 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 
 	// 读取现有正文：受保护 → 用当前密码解密；否则就是明文（可能不存在 = 空笔记设密码）
 	var plain []byte
+	var origBody []byte // 原始落盘字节（加密态），meta rename 失败时回滚用
 	var hadBody bool
 	if b, err := os.ReadFile(notePath(slug)); err == nil {
 		hadBody = true
+		origBody = b
 		if protected {
 			pt, derr := decryptBody(body.Current, b)
 			if derr != nil {
@@ -1593,6 +1712,26 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 
+	// 事务化写入（评审 P1-2）：先写 meta.tmp（fsync）→ rename 正文 → rename meta；
+	// 任一步失败即中止，meta rename 失败时回滚正文，杜绝
+	// 「正文已换新密钥、meta 哈希还是旧的」这种永久不可读的不一致状态。
+	rollback := func() {
+		if !hadBody {
+			if err := os.Remove(notePath(slug)); err != nil {
+				log.Printf("note /%s: CRITICAL rollback remove failed: %v", slug, err)
+			}
+			return
+		}
+		tmp := notePath(slug) + ".tmp"
+		if err := writeFileSync(tmp, origBody); err != nil {
+			log.Printf("note /%s: CRITICAL rollback write failed: %v", slug, err)
+			return
+		}
+		if err := os.Rename(tmp, notePath(slug)); err != nil {
+			log.Printf("note /%s: CRITICAL rollback rename failed: %v", slug, err)
+		}
+	}
+
 	if body.Action == "set" {
 		if len(body.Password) < 4 || len(body.Password) > 128 {
 			fail(w, http.StatusBadRequest, "密码长度需 4–128 位")
@@ -1604,19 +1743,6 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 			fail(w, http.StatusInternalServerError, "正文加密失败")
 			return
 		}
-		if err := os.MkdirAll(noteDir(slug), 0o700); err != nil {
-			fail(w, http.StatusInternalServerError, "写入失败")
-			return
-		}
-		tmp := notePath(slug) + ".tmp"
-		if err := os.WriteFile(tmp, blob, 0o600); err != nil {
-			fail(w, http.StatusInternalServerError, "写入失败")
-			return
-		}
-		if err := os.Rename(tmp, notePath(slug)); err != nil {
-			fail(w, http.StatusInternalServerError, "写入失败")
-			return
-		}
 		hash, herr := newPwdHash(body.Password)
 		if herr != nil {
 			fail(w, http.StatusInternalServerError, "密码哈希生成失败")
@@ -1626,8 +1752,33 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 		if m.TTLHours == 0 { // 与 persistNote 同规则：0 会 ttlFor 被当无效值按 7 天，落成全局默认
 			m.TTLHours = int(cfg().ttl.Hours())
 		}
-		if mb, err := json.Marshal(m); err == nil {
-			_ = os.WriteFile(metaPath(slug), mb, 0o600)
+		mb, merr := json.Marshal(m)
+		if merr != nil {
+			fail(w, http.StatusInternalServerError, "写入失败")
+			return
+		}
+		if err := os.MkdirAll(noteDir(slug), 0o700); err != nil {
+			fail(w, http.StatusInternalServerError, "写入失败")
+			return
+		}
+		metaTmp := metaPath(slug) + ".tmp"
+		if err := writeFileSync(metaTmp, mb); err != nil {
+			fail(w, http.StatusInternalServerError, "写入失败")
+			return
+		}
+		tmp := notePath(slug) + ".tmp"
+		if err := writeFileSync(tmp, blob); err != nil {
+			fail(w, http.StatusInternalServerError, "写入失败")
+			return
+		}
+		if err := os.Rename(tmp, notePath(slug)); err != nil {
+			fail(w, http.StatusInternalServerError, "写入失败")
+			return
+		}
+		if err := os.Rename(metaTmp, metaPath(slug)); err != nil {
+			rollback() // 正文已是新密文但 meta 还是旧哈希 → 立即回滚正文
+			fail(w, http.StatusInternalServerError, "写入失败（已回滚，请重试）")
+			return
 		}
 		clearLoginFails(ip)
 		log.Printf("note /%s: password set (body %d bytes)", slug, len(plain))
@@ -1640,9 +1791,23 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 		fail(w, http.StatusBadRequest, "该笔记未设密码")
 		return
 	}
+	m.PwdHash = ""
+	if m.TTLHours == 0 {
+		m.TTLHours = int(cfg().ttl.Hours())
+	}
+	mb, merr := json.Marshal(m)
+	if merr != nil {
+		fail(w, http.StatusInternalServerError, "写入失败")
+		return
+	}
+	metaTmp := metaPath(slug) + ".tmp"
+	if err := writeFileSync(metaTmp, mb); err != nil {
+		fail(w, http.StatusInternalServerError, "写入失败")
+		return
+	}
 	if hadBody {
 		tmp := notePath(slug) + ".tmp"
-		if err := os.WriteFile(tmp, plain, 0o600); err != nil {
+		if err := writeFileSync(tmp, plain); err != nil {
 			fail(w, http.StatusInternalServerError, "写入失败")
 			return
 		}
@@ -1651,16 +1816,32 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	m.PwdHash = ""
-	if m.TTLHours == 0 {
-		m.TTLHours = int(cfg().ttl.Hours())
-	}
-	if mb, err := json.Marshal(m); err == nil {
-		_ = os.WriteFile(metaPath(slug), mb, 0o600)
+	if err := os.Rename(metaTmp, metaPath(slug)); err != nil {
+		rollback() // 正文已还原明文但 meta 还标着受保护 → 立即回滚正文
+		fail(w, http.StatusInternalServerError, "写入失败（已回滚，请重试）")
+		return
 	}
 	clearLoginFails(ip)
 	log.Printf("note /%s: password removed", slug)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pwd": false})
+}
+
+// GET /api/{slug}/ntok —— 签发附件短时令牌（受保护笔记解锁后供 <img>/下载链接使用）
+func noteToken(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	if !validSlug(slug) {
+		fail(w, http.StatusNotFound, "无效的笔记地址")
+		return
+	}
+	_, protected, ok := noteAuth(w, r, slug)
+	if !ok {
+		return
+	}
+	tok := ""
+	if protected {
+		tok = noteAttachToken(slug)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ntok": tok})
 }
 
 // POST /api/logout —— 注销：吊销服务端会话（不只是删 Cookie）
@@ -1699,6 +1880,32 @@ func exportZip(w http.ResponseWriter, r *http.Request) {
 	}
 	touch(slug)
 
+	// 正文先解密再写响应头（评审 P2-2）：解密失败以 500 干净中止，
+	// 绝不在 zip 里悄悄放一个空的 note.md 让用户误以为正文为空。
+	var bodySrc io.Reader
+	if protected {
+		b, rerr := os.ReadFile(np)
+		if rerr != nil {
+			fail(w, http.StatusInternalServerError, "读取正文失败")
+			return
+		}
+		pt, derr := decryptBody(password, b)
+		if derr != nil {
+			log.Printf("note /%s: export decrypt failed: %v", slug, derr)
+			fail(w, http.StatusInternalServerError, "正文解密失败（数据损坏）")
+			return
+		}
+		bodySrc = bytes.NewReader(pt)
+	} else {
+		f, err := os.Open(np)
+		if err != nil {
+			fail(w, http.StatusInternalServerError, "读取正文失败")
+			return
+		}
+		defer f.Close()
+		bodySrc = f
+	}
+
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", dispositionHeader("attachment", slug+".zip"))
 
@@ -1706,20 +1913,8 @@ func exportZip(w http.ResponseWriter, r *http.Request) {
 	defer zw.Close()
 
 	// 正文（受保护笔记导出解密后的明文；附件始终不加密）
-	if f, err := os.Open(np); err == nil {
-		if zentry, err := zw.CreateHeader(&zip.FileHeader{Name: "note.md", Modified: time.Now()}); err == nil {
-			if protected {
-				b, rerr := io.ReadAll(f)
-				if rerr == nil {
-					if pt, derr := decryptBody(password, b); derr == nil {
-						_, _ = zentry.Write(pt)
-					}
-				}
-			} else {
-				_, _ = io.Copy(zentry, f)
-			}
-		}
-		f.Close()
+	if zentry, err := zw.CreateHeader(&zip.FileHeader{Name: "note.md", Modified: time.Now()}); err == nil {
+		_, _ = io.Copy(zentry, bodySrc)
 	}
 	// 附件
 	if entries, err := os.ReadDir(filepath.Join(noteDir(slug), filesDir)); err == nil {
@@ -2314,6 +2509,24 @@ var (
 	pageEditor = buildPage(true)
 )
 
+// cspInlineStyle 内联 CSS 的 CSP 白名单项（'sha256-...'）；CSS 读取失败时为空
+// （页面退回外链样式表，style-src 只剩 'self'，功能不受损）
+var cspInlineStyle string
+
+// pageCSP 页面专属 CSP：style-src 放行本页内联样式块（哈希白名单），其余严格同源。
+// 覆盖 securityHeaders 中间件的默认值；必须在 ETag 304 分支之前就设置——
+// 否则 304 响应会带着中间件的 style-src 'self' 落进浏览器缓存条目，
+// 缓存复用时内联 <style> 被拦截，整页裸奔（reload 强制重校验，必现）。
+func pageCSP() string {
+	styleSrc := "'self'"
+	if cspInlineStyle != "" {
+		styleSrc += " " + cspInlineStyle
+	}
+	return "default-src 'self'; img-src 'self' data:; script-src 'self'; " +
+		"style-src " + styleSrc + "; connect-src 'self'; " +
+		"frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
+}
+
 // buildPage 按页面准备 HTML：内联压缩后的样式表，首页裁掉用不到的脚本。
 func buildPage(editor bool) []byte {
 	raw, err := fs.ReadFile(staticFS, "static/index.html")
@@ -2322,10 +2535,11 @@ func buildPage(editor bool) []byte {
 	}
 	page := strings.ReplaceAll(string(raw), "__V__", staticVer)
 	if css, err := fs.ReadFile(staticFS, "static/style.css"); err == nil {
+		min := minifyCSS(string(css))
 		link := `<link rel="stylesheet" href="/static/style.css?v=` + staticVer + `">`
-		// __NONCE__ 每请求替换为随机值，页面 CSP 据此只放行这一块内联样式
-		page = strings.Replace(page,
-			link, `<style nonce="__NONCE__">`+minifyCSS(string(css))+`</style>`, 1)
+		page = strings.Replace(page, link, "<style>"+min+"</style>", 1)
+		sum := sha256.Sum256([]byte(min))
+		cspInlineStyle = "'sha256-" + base64.StdEncoding.EncodeToString(sum[:]) + "'"
 	}
 	if !editor {
 		// 首页不解析 Markdown，marked + DOMPurify（约 27 KB）纯属浪费带宽
@@ -2369,15 +2583,6 @@ func dropBetween(s, start, end string) string {
 		return s
 	}
 	return s[:i] + s[i+j+len(end):]
-}
-
-// newNonce 生成一次性 CSP nonce（随机 12 字节，hex 编码）。
-func newNonce() string {
-	var b [12]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		return "sznote-fallback-nonce"
-	}
-	return hex.EncodeToString(b[:])
 }
 
 // bootCap 服务端内嵌正文的字节上限：超过则退回接口加载（避免大笔记拖慢首屏）
@@ -2431,23 +2636,18 @@ func pageHandler(w http.ResponseWriter, r *http.Request) {
 	// 页面壳体可缓存：回访直接读磁盘缓存（stale-while-revalidate 后台刷新），
 	// LCP 趋近 0；/static/ 资源按内容哈希强缓存，旧壳体 + 新资源也能正常解析。
 	w.Header().Set("Cache-Control", ttl)
-	// ETag 基于壳体 + 内嵌正文（不含每请求变化的 nonce），后台重校验时命中 304 零传输
+	// ETag 基于壳体 + 内嵌正文（不含每请求变化的头），后台重校验时命中 304 零传输
 	sum := sha256.Sum256(tpl)
 	etag := `"` + hex.EncodeToString(sum[:8]) + `"`
 	w.Header().Set("ETag", etag)
+	// CSP 必须在 304 分支之前覆写中间件默认值：304 的头会被浏览器并入缓存条目
+	w.Header().Set("Content-Security-Policy", pageCSP())
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	if match := r.Header.Get("If-None-Match"); match != "" && strings.Contains(match, etag) {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
-	nonce := newNonce()
-	// 页面专属 CSP：只放行本次请求的内联样式块（nonce 每次不同），其余仍严格同源。
-	// 覆盖 securityHeaders 里的默认值；nonce 对内联 style 属性无效，故不放宽 style-src-attr。
-	w.Header().Set("Content-Security-Policy",
-		"default-src 'self'; img-src 'self' data:; script-src 'self'; "+
-			"style-src 'self' 'nonce-"+nonce+"'; connect-src 'self'; "+
-			"frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(bytes.ReplaceAll(tpl, []byte("__NONCE__"), []byte(nonce)))
+	_, _ = w.Write(tpl)
 }
 
 // GET /api/session —— 前端会话探测（需登录）。
@@ -2794,6 +2994,7 @@ func main() {
 	mux.HandleFunc("POST /api/{slug}/upload", requireAuth(upload))
 	mux.HandleFunc("POST /api/{slug}/password", requireAuth(setNotePassword))
 	mux.HandleFunc("GET /api/{slug}/export", requireAuth(exportZip))
+	mux.HandleFunc("GET /api/{slug}/ntok", requireAuth(noteToken))
 	mux.HandleFunc("DELETE /api/{slug}/file/{name}", requireAuth(delFile))
 	mux.HandleFunc("POST /api/transfer/init", requireAuth(trInit))
 	mux.HandleFunc("GET /api/transfer", requireAuth(trList))

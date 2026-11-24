@@ -12,7 +12,7 @@
 
 - **短链 / 自定义地址**：`http://<host>:9720/39gj29` 或 `/自定义名`（字母数字、`-`、`_`，最短 6 位、最长 64 位）
 - **站点密码保护**：设置密码后，阅读 / 编辑 / 上传统一登录；密码支持明文或 PBKDF2 哈希（`sznote -hash` 生成，推荐）；会话存服务端（退出登录 / 重启即吊销），**空闲超时自动登出**（默认 30 分钟无操作即吊销，页面主动提示重新登录），Cookie 带 `HttpOnly + SameSite=Strict`，HTTPS 下自动加 `Secure`；连续失败 5 次锁 IP 10 分钟
-- **单笔记密码**：顶栏「锁定」给单条笔记单独加锁——正文以 AES-256-CBC **加密落盘**（PBKDF2 派生密钥，磁盘上不存明文），密码经 `X-Note-Password` 头随读 / 写 / 导出请求发送，密码错时计入登录失败锁定；密码在本标签页 sessionStorage 临时保存；附件不加密；公网部署密码明文过网，请配 HTTPS
+- **单笔记密码**：顶栏「锁定」给单条笔记单独加锁——正文以 AES-256-GCM **加密落盘**（PBKDF2 派生密钥 + 认证标签防篡改，磁盘上不存明文），密码经 `X-Note-Password` 头随读 / 写 / 导出请求发送，密码错时计入登录失败锁定；密码在本标签页 sessionStorage 临时保存；**附件访问（下载 / 上传 / 删除）同样需要密码**——预览图片与下载链接改用 15 分钟有效的短时令牌（`?ntok=`），附件本体不加密；公网部署密码明文过网，请配 HTTPS
 - **Markdown 工具栏**：加粗 / 斜体 / 标题循环（无→h1→…→h6→无）/ 链接 / 图片一键插入，`Ctrl+B` / `Ctrl+I` / `Ctrl+K` 快捷键同效
 - **Markdown + 三态预览**：点「预览」＝分屏，再点＝全屏预览，再点回到编辑（`Ctrl+P` 同效）
 - **纯文本模式**：一键切到纯文本（每个笔记独立记忆），不解析 Markdown，日志里的 `#`、`*`、`_` 原样保留，附「复制全部」；适合贴日志、命令
@@ -191,8 +191,9 @@ data/notes/<地址>/
 | POST | `/api/{slug}/upload` | multipart 上传，字段名 `file` |
 | POST | `/api/{slug}/password` | 单笔记密码：`{"action":"set","password":"..","current":".."}`（已设密码时 `current` 必填）或 `{"action":"remove","current":".."}`；set 后正文加密落盘 |
 | DELETE | `/api/{slug}/file/{name}` | 删除附件 |
+| GET | `/api/{slug}/ntok` | 签发附件短时令牌（15 分钟有效，受保护笔记的 `<img>` / 下载链接用 `?ntok=` 携带） |
 | GET | `/api/{slug}/export` | 整包导出 zip |
-| GET | `/f/{slug}/{name}` | 附件访问（图片 / PDF / 文本内嵌，其余下载） |
+| GET | `/f/{slug}/{name}` | 附件访问（图片 / PDF / 文本内嵌，其余下载）；受保护笔记需 `X-Note-Password` 头或 `?ntok=` 令牌 |
 | POST | `/api/transfer/init` | 创建/续接发送会话，body `{"name","size","token"}`，返回 `{code, chunk, offset}` |
 | PUT | `/api/transfer/{code}/chunk?offset=N` | 追加一块数据（服务端限速读取；offset 与服务端不一致时返回 409 + 当前进度） |
 | POST | `/api/transfer/{code}/complete` | 结束发送：校验字节数后对接收方可见 |

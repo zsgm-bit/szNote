@@ -24,6 +24,32 @@ try { notePwd = sessionStorage.getItem("sznote_pwd_" + slug) || ""; } catch { /*
 let noteHasPwd = false;
 const pwdHeader = () => notePwd ? { "X-Note-Password": notePwd } : {};
 
+/* 附件短时令牌：受保护笔记的 <img>/下载链接无法带自定义请求头，
+   解锁后由 getNote / /api/{slug}/ntok 签发 HMAC 令牌（15 分钟有效），访问 /f/ 附件时附带 */
+let noteNtok = "";
+let noteNtokAt = 0;
+async function ensureNtok(force = false) {
+  if (!noteHasPwd) return "";
+  if (!force && noteNtok && Date.now() - noteNtokAt < 9 * 60 * 1000) return noteNtok;
+  try {
+    const r = await fetch("/api/" + encodeURIComponent(slug) + "/ntok", { headers: pwdHeader() });
+    if (r.ok) { const d = await r.json(); noteNtok = d.ntok || ""; noteNtokAt = Date.now(); }
+  } catch { /* 网络失败沿用旧令牌 */ }
+  return noteNtok;
+}
+function tokUrl(u) {
+  if (!noteHasPwd || !noteNtok || !u || !u.startsWith("/f/")) return u;
+  return u + (u.includes("?") ? "&" : "?") + "ntok=" + encodeURIComponent(noteNtok);
+}
+/* 预览区附件链接改写（Markdown 里的 ![](/f/...) 与下载链接） */
+function rewriteAttachUrls(root) {
+  if (!noteHasPwd || !noteNtok) return;
+  root.querySelectorAll('img[src^="/f/"], a[href^="/f/"]').forEach((el) => {
+    const attr = el.tagName === "IMG" ? "src" : "href";
+    el.setAttribute(attr, tokUrl(el.getAttribute(attr)));
+  });
+}
+
 /* ---------- 通用 ---------- */
 
 let toastTimer = null;
@@ -131,6 +157,7 @@ function render() {
   }
   const html = marked.parse(src, { gfm: true, breaks: true });
   preview.innerHTML = DOMPurify.sanitize(html, PURIFY_CFG);
+  rewriteAttachUrls(preview);
   decorateCodeBlocks();
 }
 
@@ -423,8 +450,9 @@ function setupEditor() {
     /* 只加载本站附件与 data: 图片，外链图片不请求 */
     const safeImg = hit && (hit.url.startsWith("/f/") || hit.url.startsWith("data:image/"));
     if (hit && safeImg) {
-      if (hoverImg.getAttribute("src") !== hit.url) {
-        hoverImg.src = hit.url;
+      const showUrl = tokUrl(hit.url);
+      if (hoverImg.getAttribute("src") !== showUrl) {
+        hoverImg.src = showUrl;
         hoverName.textContent = hit.alt || decodeURIComponent(hit.url.split("/").pop() || "");
       }
       hover.classList.add("show");
@@ -548,8 +576,14 @@ function setupGutter(ta) {
   const LH = parseFloat(cs0.lineHeight) || 24.5;
   const mirror = document.createElement("div");
   const ms = mirror.style;
-  ms.cssText = "position:absolute;left:-99999px;top:0;visibility:hidden;" +
-    "white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;";
+  /* CSP style-src 'self' 会拦截 cssText/内联 style 属性，逐条 CSSOM 赋值不受限 */
+  ms.position = "absolute";
+  ms.left = "-99999px";
+  ms.top = "0";
+  ms.visibility = "hidden";
+  ms.whiteSpace = "pre-wrap";
+  ms.overflowWrap = "break-word";
+  ms.wordBreak = "normal";
   document.body.appendChild(mirror);
   const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 
@@ -624,6 +658,7 @@ async function load() {
     if ($("content").__gutter) $("content").__gutter();   // 行号列随内容重排
     setPlain(!!d.plain, false);
     noteHasPwd = !!d.pwd;
+    if (d.pwd) { noteNtok = d.ntok || ""; noteNtokAt = Date.now(); }
     updateLockBtn();
     renderFiles(d.files || []);
     setStatus(d.exists ? "已加载" : "新笔记，首次保存后生效");
@@ -918,8 +953,10 @@ async function uploadFile(file, isImage, insert = true) {
   const fd = new FormData();
   fd.append("file", file);
   try {
-    const r = await fetch("/api/" + encodeURIComponent(slug) + "/upload", { method: "POST", body: fd });
+    const r = await fetch("/api/" + encodeURIComponent(slug) + "/upload", { method: "POST", headers: pwdHeader(), body: fd });
     if (r.status === 401) {
+      const d = await r.json().catch(() => ({}));
+      if (d.protected) { openPwdModal("unlock", "受保护笔记需先解锁才能上传附件"); return; }
       showLoginScreen("登录已超时，请重新登录");
       return;
     }
@@ -962,11 +999,11 @@ function renderFiles(files) {
     if (IMG_EXT.test(f.name)) {
       thumb = document.createElement("img");
       thumb.className = "fthumb";
-      thumb.src = f.url;
+      thumb.src = tokUrl(f.url);
       thumb.loading = "lazy";
       thumb.alt = f.name;
       thumb.title = "点击放大预览";
-      thumb.onclick = () => window.open(f.url, "_blank");
+      thumb.onclick = () => window.open(tokUrl(f.url), "_blank");
     } else {
       thumb = document.createElement("span");
       thumb.className = "ficon";
@@ -977,7 +1014,7 @@ function renderFiles(files) {
     const name = document.createElement("a");
     name.className = "fname";
     name.textContent = f.name;
-    name.href = f.url;
+    name.href = tokUrl(f.url);
     name.setAttribute("download", f.name);
     name.title = "点击下载 " + f.name;
 
@@ -989,7 +1026,7 @@ function renderFiles(files) {
     const dl = document.createElement("a");
     dl.className = "fbtn";
     dl.textContent = "⬇";
-    dl.href = f.url;
+    dl.href = tokUrl(f.url);
     dl.setAttribute("download", f.name);
     dl.title = "下载 " + f.name;
 
@@ -999,8 +1036,13 @@ function renderFiles(files) {
     del.title = "删除此附件";
     del.onclick = async () => {
       if (!confirm("删除附件 " + f.name + "？笔记正文中的引用会变成死链。")) return;
-      const resp = await fetch("/api/" + encodeURIComponent(slug) + "/file/" + encodeURIComponent(f.name), { method: "DELETE" });
-      if (resp.status === 401) { showLoginScreen("登录已超时，请重新登录"); return; }
+      const resp = await fetch("/api/" + encodeURIComponent(slug) + "/file/" + encodeURIComponent(f.name), { method: "DELETE", headers: pwdHeader() });
+      if (resp.status === 401) {
+        const d = await resp.json().catch(() => ({}));
+        if (d.protected) { openPwdModal("unlock", "受保护笔记需先解锁才能管理附件"); return; }
+        showLoginScreen("登录已超时，请重新登录");
+        return;
+      }
       refreshFiles();
     };
 
