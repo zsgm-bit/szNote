@@ -348,6 +348,34 @@ code, .mono { font-family: var(--font-mono); }
 #plainHint .mini { background: #fff; box-shadow: inset 0 0 0 1px #d9d3ff; color: #5138c5; }
 #plainHint .mini:hover { background: #eeebff; box-shadow: inset 0 0 0 1px #b8aeff; color: #3f2ba8; }
 
+/* ---------- Markdown 工具栏（编辑器页显示，全屏预览时由 JS 加 hidden） ---------- */
+#mdToolbar {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 3px;
+  padding: 6px 14px;
+  border-bottom: 1px solid #e5e8ef;
+  background: #fff;
+}
+#mdToolbar button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: #475467;
+  cursor: pointer;
+}
+#mdToolbar button:hover { background: #eef1f7; color: #1d2939; }
+#mdToolbar button:active { background: #e0e6ef; }
+#mdToolbar .icon { width: 17px; height: 17px; }
+#mdToolbar .tb-sep { width: 1px; height: 16px; margin: 0 5px; background: #e5e8ef; }
+
 .editor-body {
   display: flex;
   flex: 1;

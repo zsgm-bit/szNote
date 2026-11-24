@@ -12,6 +12,8 @@
 
 - **短链 / 自定义地址**：`http://<host>:9720/39gj29` 或 `/自定义名`（字母数字、`-`、`_`，最短 6 位、最长 64 位）
 - **站点密码保护**：设置密码后，阅读 / 编辑 / 上传统一登录；密码支持明文或 PBKDF2 哈希（`sznote -hash` 生成，推荐）；会话存服务端（退出登录 / 重启即吊销），**空闲超时自动登出**（默认 30 分钟无操作即吊销，页面主动提示重新登录），Cookie 带 `HttpOnly + SameSite=Strict`，HTTPS 下自动加 `Secure`；连续失败 5 次锁 IP 10 分钟
+- **单笔记密码**：顶栏「锁定」给单条笔记单独加锁——正文以 AES-256-CBC **加密落盘**（PBKDF2 派生密钥，磁盘上不存明文），密码经 `X-Note-Password` 头随读 / 写 / 导出请求发送，密码错时计入登录失败锁定；密码在本标签页 sessionStorage 临时保存；附件不加密；公网部署密码明文过网，请配 HTTPS
+- **Markdown 工具栏**：加粗 / 斜体 / 标题循环（无→h1→…→h6→无）/ 链接 / 图片一键插入，`Ctrl+B` / `Ctrl+I` / `Ctrl+K` 快捷键同效
 - **Markdown + 三态预览**：点「预览」＝分屏，再点＝全屏预览，再点回到编辑（`Ctrl+P` 同效）
 - **纯文本模式**：一键切到纯文本（每个笔记独立记忆），不解析 Markdown，日志里的 `#`、`*`、`_` 原样保留，附「复制全部」；适合贴日志、命令
 - **图片粘贴 / 拖拽**：`Ctrl+V` 贴截图自动上传并插入引用；拖到编辑区插引用，拖到右侧附件栏只存不插
@@ -181,12 +183,13 @@ data/notes/<地址>/
 | POST | `/api/login` | 登录，body `{"password":"..."}` |
 | POST | `/api/logout` | 退出登录 |
 | GET | `/api/session` | 会话探测（需登录；只读校验，不刷新空闲计时，供前端轮询弹回登录页） |
-| GET | `/api/{slug}` | 读取笔记 `{slug, exists, content, files[], ttl_hours, plain}` |
-| PUT | `/api/{slug}` | 保存，body `{"content":"...","ttl_hours":24,"plain":false}` |
+| GET | `/api/{slug}` | 读取笔记 `{slug, exists, content, files[], ttl_hours, plain, pwd}`；受保护笔记要求请求头 `X-Note-Password`，未提供 / 错误返回 401 `{protected:true}` |
+| PUT | `/api/{slug}` | 保存，body `{"content":"...","ttl_hours":24,"plain":false}`；受保护笔记同样要求 `X-Note-Password` |
 | GET | `/api/{slug}/raw` | 纯文本读正文（curl 友好；不存在返回 404；响应头带 `X-Note-Ttl-Hours`/`X-Note-Plain`） |
 | PUT / POST | `/api/{slug}/raw` | 纯文本写正文：请求体即原文，可选 `?ttl=24\|72\|120\|168&plain=true\|false` |
 | PUT | `/{slug}` | 上条纯文本写的路径别名（`curl -T 1.txt http://host:8080/mynote`） |
 | POST | `/api/{slug}/upload` | multipart 上传，字段名 `file` |
+| POST | `/api/{slug}/password` | 单笔记密码：`{"action":"set","password":"..","current":".."}`（已设密码时 `current` 必填）或 `{"action":"remove","current":".."}`；set 后正文加密落盘 |
 | DELETE | `/api/{slug}/file/{name}` | 删除附件 |
 | GET | `/api/{slug}/export` | 整包导出 zip |
 | GET | `/f/{slug}/{name}` | 附件访问（图片 / PDF / 文本内嵌，其余下载） |

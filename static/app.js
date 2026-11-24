@@ -18,6 +18,12 @@ let HEALTH = {}; // /api/health 结果：transfer 配置等，boot 时填充
 let saveTimer = null;
 let renderTimer = null;
 
+/* 单笔记密码：仅存 sessionStorage（标签页关闭即清），随请求头 X-Note-Password 发送 */
+let notePwd = "";
+try { notePwd = sessionStorage.getItem("sznote_pwd_" + slug) || ""; } catch { /* 隐私模式 */ }
+let noteHasPwd = false;
+const pwdHeader = () => notePwd ? { "X-Note-Password": notePwd } : {};
+
 /* ---------- 通用 ---------- */
 
 let toastTimer = null;
@@ -334,7 +340,8 @@ function setupEditor() {
   $("btnPlainOff").onclick = () => setPlain(false, true);
   $("btnCopyAll").onclick = () => copyText($("content").value);
   $("btnUpload").onclick = () => $("fileInput").click();
-  $("btnExport").onclick = () => window.open("/api/" + encodeURIComponent(slug) + "/export", "_blank");
+  $("btnExport").onclick = exportNote;
+  $("btnLock").onclick = () => openPwdModal("manage");
   $("btnLogout").onclick = async (e) => {
     e.preventDefault();
     await fetch("/api/logout", { method: "POST" });
@@ -378,8 +385,19 @@ function setupEditor() {
   ta.addEventListener("keydown", (e) => {
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") { e.preventDefault(); save(); }
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p") { e.preventDefault(); togglePreview(); }
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey) {
+      const k = e.key.toLowerCase();
+      if (k === "b") { e.preventDefault(); applyMd("bold"); }
+      else if (k === "i") { e.preventDefault(); applyMd("italic"); }
+      else if (k === "k") { e.preventDefault(); applyMd("link"); }
+    }
     if (e.key === "Tab") { e.preventDefault(); insertAtCursor("  "); }
   });
+
+  setupToolbar();
+  setupPwdModal();
+  $("mdToolbar").classList.toggle("hidden", plainMode);
+  updateLockBtn();
 
   /* 悬停图片行：浮层直接显示图片和图片名 */
   const hover = document.createElement("div");
@@ -593,9 +611,11 @@ function setupGutter(ta) {
 }
 
 async function load() {
-  const r = await fetch("/api/" + encodeURIComponent(slug));
-  if (r.status === 401) {  // 会话过期 → 回到登录页
-    showLoginScreen("登录已超时，请重新登录");
+  const r = await fetch("/api/" + encodeURIComponent(slug), { headers: pwdHeader() });
+  if (r.status === 401) {
+    const d = await r.json().catch(() => ({}));
+    if (d.protected) { openPwdModal("unlock"); setStatus("该笔记已设密码"); return; }
+    showLoginScreen("登录已超时，请重新登录");  // 会话过期 → 回到登录页
     return;
   }
   try {
@@ -603,6 +623,8 @@ async function load() {
     if (d.exists) $("content").value = d.content;
     if ($("content").__gutter) $("content").__gutter();   // 行号列随内容重排
     setPlain(!!d.plain, false);
+    noteHasPwd = !!d.pwd;
+    updateLockBtn();
     renderFiles(d.files || []);
     setStatus(d.exists ? "已加载" : "新笔记，首次保存后生效");
     if (d.exists) render();
@@ -629,10 +651,12 @@ async function save() {
     if (TTL_DAYS.includes(ttl)) payload.ttl_hours = ttl;
     const r = await fetch("/api/" + encodeURIComponent(slug), {
       method: "PUT",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...pwdHeader() },
       body: JSON.stringify(payload),
     });
     if (r.status === 401) {
+      const d = await r.json().catch(() => ({}));
+      if (d.protected) { openPwdModal("unlock", "笔记密码不正确或已变更，请重新解锁"); return; }
       showLoginScreen("登录已超时，请重新登录");
       return;
     }
@@ -648,6 +672,194 @@ async function save() {
     const msg = err.message || "未知错误";
     toast("保存失败：" + msg + (/上限|大小/.test(msg) ? "" : "（单条笔记上限 " + MAX_NOTE_MB + " MB）"));
   }
+}
+
+async function exportNote() {
+  try {
+    const r = await fetch("/api/" + encodeURIComponent(slug) + "/export", { headers: pwdHeader() });
+    if (r.status === 401) {
+      const d = await r.json().catch(() => ({}));
+      if (d.protected) { openPwdModal("unlock", "受保护笔记需先解锁才能导出"); return; }
+      showLoginScreen("登录已超时，请重新登录");
+      return;
+    }
+    if (!r.ok) throw new Error("http " + r.status);
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = slug + ".zip";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  } catch {
+    toast("导出失败");
+  }
+}
+
+/* ---------- Markdown 工具栏（按钮与 Ctrl+B/I/K 共用同一 applyMd） ---------- */
+
+function applyMd(action) {
+  const ta = $("content");
+  const s = ta.selectionStart, e = ta.selectionEnd, v = ta.value;
+  const sel = v.slice(s, e);
+
+  if (action === "heading") { // 标题循环切换：无级别 → h1 → … → h6 → 无级别
+    const ls = v.lastIndexOf("\n", s - 1) + 1;
+    let le = v.indexOf("\n", e);
+    if (le === -1) le = v.length;
+    const line = v.slice(ls, le);
+    const m = line.match(/^(#{1,6})\s/);
+    const level = m ? m[1].length : 0;
+    const next = level >= 6 ? 0 : level + 1;
+    const body = line.replace(/^#{1,6}\s+/, "");
+    const text = next === 0 ? body : "#".repeat(next) + " " + body;
+    ta.value = v.slice(0, ls) + text + v.slice(le);
+    ta.selectionStart = ls;
+    ta.selectionEnd = ls + text.length;
+    ta.focus();
+    ta.dispatchEvent(new Event("input"));
+    return;
+  }
+
+  let text = "", cs = 0, ce = 0; // 插入文本 + 相对选中区（占位文本直接处于选中态，输入即替换）
+  if (action === "bold") {
+    const inner = sel || "加粗文本";
+    text = "**" + inner + "**";
+    cs = 2; ce = 2 + inner.length;
+  } else if (action === "italic") {
+    const inner = sel || "斜体文本";
+    text = "*" + inner + "*";
+    cs = 1; ce = 1 + inner.length;
+  } else if (action === "link") {
+    const label = sel || "链接文本";
+    text = "[" + label + "](https://)";
+    cs = label.length + 3; ce = text.length;
+  } else if (action === "image") {
+    text = "![" + (sel || "图片描述") + "](图片地址)";
+    cs = text.lastIndexOf("(") + 1; ce = text.length - 1;
+  } else {
+    return;
+  }
+  ta.value = v.slice(0, s) + text + v.slice(e);
+  ta.selectionStart = s + cs;
+  ta.selectionEnd = s + ce;
+  ta.focus();
+  ta.dispatchEvent(new Event("input"));
+}
+
+function setupToolbar() {
+  $("mdToolbar").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-md]");
+    if (btn) applyMd(btn.dataset.md);
+  });
+}
+
+/* ---------- 单笔记密码：解锁弹窗 + 设置/移除 ---------- */
+
+function updateLockBtn() {
+  const b = $("btnLock");
+  if (!b) return;
+  b.classList.toggle("active", noteHasPwd);
+  b.title = noteHasPwd ? "笔记密码：已设密码（正文加密落盘），点击管理" : "笔记密码：给这条笔记单独加锁";
+}
+
+function pwdFail(msg) {
+  const el = $("pwdError");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+}
+
+function openPwdModal(mode, msg) {
+  $("pwdUnlock").classList.toggle("hidden", mode !== "unlock");
+  $("pwdManage").classList.toggle("hidden", mode !== "manage");
+  $("pwdError").classList.add("hidden");
+  $("pwdState").textContent = noteHasPwd
+    ? "当前状态：已设密码（正文已加密落盘）"
+    : "当前状态：未设密码";
+  if (msg) pwdFail(msg);
+  $("pwdMask").classList.remove("hidden");
+  (mode === "unlock" ? $("pwdInput") : $("pwdNew")).focus();
+}
+
+function closePwdModal() { $("pwdMask").classList.add("hidden"); }
+
+function storePwd(pw) {
+  notePwd = pw;
+  try {
+    if (pw) sessionStorage.setItem("sznote_pwd_" + slug, pw);
+    else sessionStorage.removeItem("sznote_pwd_" + slug);
+  } catch { /* 隐私模式 */ }
+}
+
+function setupPwdModal() {
+  $("pwdClose").onclick = closePwdModal;
+  $("pwdMask").addEventListener("click", (e) => { if (e.target === $("pwdMask")) closePwdModal(); });
+
+  const unlock = async () => {
+    const pw = $("pwdInput").value;
+    if (!pw) return;
+    const r = await fetch("/api/" + encodeURIComponent(slug), { headers: { "X-Note-Password": pw } });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) {
+      storePwd(pw);
+      noteHasPwd = !!d.pwd;
+      $("pwdInput").value = "";
+      closePwdModal();
+      load();
+    } else {
+      pwdFail(d.error || "密码错误");
+    }
+  };
+  $("btnPwdUnlock").onclick = unlock;
+  $("pwdInput").addEventListener("keydown", (e) => { if (e.key === "Enter") unlock(); });
+
+  $("btnPwdSet").onclick = async () => {
+    const np = $("pwdNew").value;
+    if (np.length < 4 || np.length > 128) { pwdFail("密码长度需 4–128 位"); return; }
+    const body = { action: "set", password: np };
+    if (noteHasPwd) body.current = $("pwdOld").value || notePwd;
+    const r = await fetch("/api/" + encodeURIComponent(slug) + "/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...pwdHeader() },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.ok) {
+      storePwd(np);
+      noteHasPwd = true;
+      $("pwdNew").value = "";
+      $("pwdOld").value = "";
+      updateLockBtn();
+      closePwdModal();
+      setStatus("已保存 " + new Date().toLocaleTimeString());
+      toast("已为该笔记设置密码，正文加密落盘");
+    } else {
+      pwdFail(d.error || "设置失败（http " + r.status + "）");
+    }
+  };
+
+  $("btnPwdRemove").onclick = async () => {
+    const cur = $("pwdOld").value || notePwd;
+    if (!cur) { pwdFail("请输入当前密码"); return; }
+    const r = await fetch("/api/" + encodeURIComponent(slug) + "/password", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...pwdHeader() },
+      body: JSON.stringify({ action: "remove", current: cur }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.ok) {
+      storePwd("");
+      noteHasPwd = false;
+      $("pwdOld").value = "";
+      updateLockBtn();
+      closePwdModal();
+      load();
+      toast("已移除该笔记密码，正文恢复明文");
+    } else {
+      pwdFail(d.error || "移除失败（http " + r.status + "）");
+    }
+  };
 }
 
 async function refreshFiles() {
@@ -670,6 +882,7 @@ function setPreviewMode(mode) {
   $("preview").classList.toggle("hidden", mode === 0);
   panes.classList.toggle("previewing", mode > 0);
   panes.classList.toggle("fullpreview", mode === 2);
+  $("mdToolbar").classList.toggle("hidden", mode === 2 || plainMode); // 全屏预览/纯文本时隐藏
   /* 顶栏中间的模式指示（兼作切换按钮），颜色随状态变化 */
   const tag = $("modeTag");
   tag.title = mode === 2 ? "返回编辑 (Ctrl+P)" : "预览：点一下分屏，再点一下全屏 (Ctrl+P)";
@@ -691,6 +904,7 @@ function setPlain(on, persist = true) {
     ? "当前：纯文本模式（不解析 Markdown）。点击切回 Markdown"
     : "当前：Markdown 模式。点击切到纯文本模式（适合贴日志 / 命令 / 配置）";
   $("plainHint").classList.toggle("hidden", !on);
+  $("mdToolbar").classList.toggle("hidden", !!on); // 纯文本模式下工具栏没有意义
   $("preview").classList.toggle("plainmode", on);
   $("content").placeholder = on
     ? "纯文本模式：直接粘贴日志、命令或配置…（不解析 Markdown，原样保存）"
