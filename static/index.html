@@ -37,6 +37,11 @@
   <symbol id="icon-italic" viewBox="0 0 24 24"><path d="M19 4h-8M13 20H5M15 4 9 20"/></symbol>
   <symbol id="icon-link2" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.5.5l2.5-2.5a5 5 0 0 0-7-7L11.5 5.5"/><path d="M14 11a5 5 0 0 0-7.5-.5L4 13a5 5 0 0 0 7 7l1.5-1.5"/></symbol>
   <symbol id="icon-heading" viewBox="0 0 24 24"><path d="M6 4v16M18 4v16M6 12h12"/></symbol>
+  <symbol id="icon-paperclip" viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+  <symbol id="icon-pin" viewBox="0 0 24 24"><line x1="12" y1="17" x2="12" y2="2"/><path d="M5 17h14l-1.7 3.5a1 1 0 0 1-.9.5H7.6a1 1 0 0 1-.9-.5z"/></symbol>
+  <symbol id="icon-chev-left" viewBox="0 0 24 24"><polyline points="15 18 9 12 15 6"/></symbol>
+  <symbol id="icon-chev-right" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+  <symbol id="icon-dock" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></symbol>
 </svg>
 
 <!-- ========== 登录（站点密码启用时显示） ========== -->
@@ -77,12 +82,14 @@
 <main id="editor" class="hidden">
   <header class="topbar">
     <a class="brand" href="/" aria-label="szNote 首页"><span class="brand-badge" aria-hidden="true"><svg class="icon"><use href="#icon-note"></use></svg></span>szNote</a>
-    <span id="statusWrap">
+    <span class="brand-divider" aria-hidden="true"></span>
+    <span id="docTitle" class="doc-title"></span>
+    <div id="statusWrap">
       <button id="btnPlain" type="button" title="切换纯文本模式：不解析 Markdown，日志与命令原样显示">Markdown</button>
       <button id="modeTag" type="button" class="hidden" title="预览"></button>
-      <span id="status" class="muted" role="status" aria-live="polite"></span>
-    </span>
+    </div>
     <div class="top-actions">
+      <button id="attachToggle" type="button" title="显示 / 收起附件面板"><svg class="icon" aria-hidden="true"><use href="#icon-paperclip"></use></svg>附件</button>
       <button id="btnLock" type="button" title="笔记密码：给这条笔记单独加锁 / 解锁"><svg class="icon" aria-hidden="true"><use href="#icon-lock"></use></svg>锁定</button>
       <button id="btnSwap" type="button" title="文件互传：发送 / 接收（服务器中转）"><svg class="icon" aria-hidden="true"><use href="#icon-swap"></use></svg>文件互传</button>
       <select id="ttlSelect" aria-label="无人访问保留时长" title="无人访问保留时长：到期后笔记与附件自动删除">
@@ -91,7 +98,7 @@
         <option value="120" title="5 天无人访问后删除">5 天</option>
         <option value="168" title="7 天无人访问后删除">7 天</option>
       </select>
-      <button id="btnExport" type="button" title="打包下载正文和附件"><svg class="icon" aria-hidden="true"><use href="#icon-download"></use></svg>导出笔记</button>
+      <button id="btnExport" type="button" title="打包下载正文和附件"><svg class="icon" aria-hidden="true"><use href="#icon-download"></use></svg>导出</button>
       <button id="btnLogout" type="button" class="ghost" title="退出登录"><svg class="icon" aria-hidden="true"><use href="#icon-logout"></use></svg>退出</button>
     </div>
   </header>
@@ -104,7 +111,8 @@
     <button id="btnPlainOff" type="button" class="mini">切回 Markdown</button>
   </div>
 
-  <!-- Markdown 工具栏（仅编辑器页、全屏预览时隐藏；操作与 Ctrl+B/I/K 快捷键一致） -->
+  <!-- Markdown 工具栏（仅编辑器页、全屏预览时隐藏；操作与 Ctrl+B/I/K 快捷键一致）。
+       停靠位置可切换：顶部 / 编辑区左侧 / 右侧（#dockBtn 循环，偏好存本机） -->
   <div id="mdToolbar" class="hidden" role="toolbar" aria-label="Markdown 格式工具栏">
     <button type="button" data-md="bold" title="加粗 (Ctrl+B)" aria-label="加粗"><svg class="icon" aria-hidden="true"><use href="#icon-bold"></use></svg></button>
     <button type="button" data-md="italic" title="斜体 (Ctrl+I)" aria-label="斜体"><svg class="icon" aria-hidden="true"><use href="#icon-italic"></use></svg></button>
@@ -112,6 +120,8 @@
     <span class="tb-sep" aria-hidden="true"></span>
     <button type="button" data-md="link" title="插入链接 (Ctrl+K)" aria-label="插入链接"><svg class="icon" aria-hidden="true"><use href="#icon-link2"></use></svg></button>
     <button type="button" data-md="image" title="插入图片引用" aria-label="插入图片引用"><svg class="icon" aria-hidden="true"><use href="#icon-image"></use></svg></button>
+    <span class="tb-hint" aria-hidden="true">Ctrl+V 粘贴截图，文件可拖入附件区</span>
+    <button id="dockBtn" type="button" class="tb-dock" title="切换工具栏位置：顶部 / 左侧 / 右侧（本机记住）" aria-label="切换工具栏停靠位置"><svg class="icon" aria-hidden="true"><use href="#icon-dock"></use></svg></button>
   </div>
 
   <div class="editor-body">
@@ -126,11 +136,31 @@
     <div id="splitH" class="divider h" title="拖动调整附件栏宽度"></div>
 
     <aside id="filesPanel" aria-label="附件列表">
-      <h3>附件 <button id="btnUpload" type="button" class="mini" title="上传附件（也可直接把文件拖进来）">＋ 上传附件</button></h3>
+      <div class="attach-head">
+        <button id="pinBtn" type="button" class="pin-btn" title="钉住：常驻显示；取消钉住后变为临时浮层，点面板外自动收起" aria-label="钉住附件面板"><svg class="icon" aria-hidden="true"><use href="#icon-pin"></use></svg></button>
+        <span class="attach-title">附件</span>
+        <span id="fileCount" class="attach-count" hidden>0</span>
+        <span class="spacer" aria-hidden="true"></span>
+        <button id="btnUpload" type="button" class="upload-btn" title="上传附件（也可直接把文件拖进来）">＋ 上传</button>
+        <button id="hideBtn" type="button" class="head-icon-btn" title="收起附件面板" aria-label="收起附件面板"><svg class="icon" aria-hidden="true"><use href="#icon-chev-right"></use></svg></button>
+      </div>
+      <div id="filesDrop" class="attach-drop" title="点击选择文件上传">
+        <p>拖文件到这里，或 <b>点击上传</b><br>支持 Ctrl+V 粘贴截图</p>
+      </div>
       <ul id="fileList"></ul>
       <p id="filesEmpty" class="muted">暂无附件。粘贴图片、上传文件或直接把文件拖到这里。</p>
     </aside>
+    <div id="attachStrip" class="attach-strip" title="展开附件面板">
+      <button id="showAttachBtn" type="button" class="head-icon-btn" aria-label="展开附件面板"><svg class="icon" aria-hidden="true"><use href="#icon-chev-left"></use></svg></button>
+      <span class="strip-label" aria-hidden="true">附件</span>
+    </div>
   </div>
+
+  <!-- 状态栏：保存状态等轻量信息 -->
+  <footer class="statusbar">
+    <span id="status" class="muted" role="status" aria-live="polite"></span>
+    <div class="right"><span>偏好仅保存在本机浏览器</span></div>
+  </footer>
 
   <input id="fileInput" type="file" multiple hidden aria-label="选择要上传的附件">
 </main>

@@ -84,6 +84,120 @@ function toast(msg) {
 
 function setStatus(msg) { $("status").textContent = msg; }
 
+/* ---------- 界面偏好（仅存本机 localStorage）：工具栏停靠 + 附件面板 ---------- */
+const UI_KEY = "sznote-ui-prefs-v1";
+const UI_DEFAULTS = { dock: "top", attachOpen: true, attachPinned: true };
+let uiPrefs = (() => {
+  try { return Object.assign({}, UI_DEFAULTS, JSON.parse(localStorage.getItem(UI_KEY) || "{}")); }
+  catch { return Object.assign({}, UI_DEFAULTS); }
+})();
+function saveUiPrefs() {
+  try { localStorage.setItem(UI_KEY, JSON.stringify(uiPrefs)); } catch { /* 隐私模式 */ }
+}
+
+/* 工具栏停靠：顶部（默认，编辑区上方通栏）/ 左侧 / 右侧竖条；≤900px 强制顶部 */
+const DOCK_ORDER = ["top", "left", "right"];
+const DOCK_LABEL = { top: "顶部", left: "左侧", right: "右侧" };
+let mdToolbarHome = null; // 原始 DOM 位置，切回顶部时还原
+
+function setupDock() {
+  const tb = $("mdToolbar");
+  mdToolbarHome = { parent: tb.parentNode, next: tb.nextSibling };
+  $("dockBtn").onclick = () => {
+    uiPrefs.dock = DOCK_ORDER[(DOCK_ORDER.indexOf(uiPrefs.dock) + 1) % DOCK_ORDER.length];
+    saveUiPrefs();
+    applyDock();
+    toast("工具栏已切换至" + DOCK_LABEL[uiPrefs.dock] + "（本机记住）");
+  };
+  let rt = 0;
+  window.addEventListener("resize", () => { clearTimeout(rt); rt = setTimeout(applyDock, 150); });
+  applyDock();
+}
+
+function applyDock() {
+  const tb = $("mdToolbar");
+  if (!tb || !mdToolbarHome) return;
+  const narrow = window.innerWidth <= 900;
+  const dock = narrow ? "top" : (DOCK_ORDER.includes(uiPrefs.dock) ? uiPrefs.dock : "top");
+  tb.classList.remove("dock-left", "dock-right");
+  const body = document.querySelector("#editor .editor-body");
+  if (!body) return;
+  if (dock === "left") {
+    tb.classList.add("dock-left");
+    body.insertBefore(tb, body.firstElementChild);
+  } else if (dock === "right") {
+    tb.classList.add("dock-right");
+    body.appendChild(tb);
+  } else {
+    mdToolbarHome.parent.insertBefore(tb, mdToolbarHome.next);
+  }
+}
+
+/* 附件面板：钉住（常驻，可拖宽）/ 临时浮层（点外部收起）/ 收起（右侧窄边条展开入口） */
+function setupAttachPanel() {
+  const panel = $("filesPanel");
+  const body = document.querySelector("#editor .editor-body");
+  const strip = $("attachStrip");
+  $("attachToggle").onclick = () => {
+    uiPrefs.attachOpen = !uiPrefs.attachOpen;
+    saveUiPrefs();
+    applyAttach();
+  };
+  $("hideBtn").onclick = (e) => {
+    e.stopPropagation();
+    uiPrefs.attachOpen = false;
+    saveUiPrefs();
+    applyAttach();
+  };
+  $("showAttachBtn").onclick = (e) => {
+    e.stopPropagation();
+    uiPrefs.attachOpen = true;
+    saveUiPrefs();
+    applyAttach();
+  };
+  strip.addEventListener("click", () => {
+    uiPrefs.attachOpen = true;
+    saveUiPrefs();
+    applyAttach();
+  });
+  $("pinBtn").onclick = (e) => {
+    e.stopPropagation();
+    uiPrefs.attachPinned = !uiPrefs.attachPinned;
+    if (!uiPrefs.attachPinned) uiPrefs.attachOpen = false; // 取消钉住：缩回窄条
+    saveUiPrefs();
+    applyAttach();
+    toast(uiPrefs.attachPinned ? "附件面板已钉住，常驻显示" : "附件面板改为临时浮层，点外部自动收起");
+  };
+  /* 未钉住的浮层：点面板外（含编辑区/预览）自动收起 */
+  body.addEventListener("click", (e) => {
+    if (uiPrefs.attachOpen && !uiPrefs.attachPinned &&
+        !panel.contains(e.target) && !strip.contains(e.target)) {
+      uiPrefs.attachOpen = false;
+      saveUiPrefs();
+      applyAttach();
+    }
+  });
+  /* 空态引导区：点击调起文件选择 */
+  $("filesDrop").onclick = () => $("fileInput").click();
+  applyAttach();
+}
+
+function applyAttach() {
+  const panel = $("filesPanel");
+  const strip = $("attachStrip");
+  const h = $("splitH");
+  const open = !!uiPrefs.attachOpen;
+  const pinned = !!uiPrefs.attachPinned;
+  panel.classList.toggle("closed", !open);
+  panel.classList.toggle("overlay", open && !pinned);
+  strip.classList.toggle("show", !open);
+  if (h) h.style.display = (open && pinned) ? "" : "none";
+  const pin = $("pinBtn");
+  if (pin) pin.classList.toggle("on", pinned);
+  const tg = $("attachToggle");
+  if (tg) tg.classList.toggle("active", open);
+}
+
 async function copyText(text) {
   try {
     await navigator.clipboard.writeText(text);
@@ -384,6 +498,8 @@ function setupHome() {
 function setupEditor() {
   const ta = $("content");
   document.title = "/" + slug + " · szNote";
+  const dt = $("docTitle");
+  if (dt) dt.textContent = "/" + slug;
 
   $("modeTag").onclick = togglePreview; // 顶栏中间的模式指示兼作预览切换按钮
   $("btnPlain").onclick = () => setPlain(!plainMode, true);
@@ -446,6 +562,8 @@ function setupEditor() {
 
   setupToolbar();
   setupPwdModal();
+  setupDock();
+  setupAttachPanel();
   $("mdToolbar").classList.toggle("hidden", plainMode);
   updateLockBtn();
 
@@ -1013,6 +1131,8 @@ function renderFiles(files) {
   const ul = $("fileList");
   ul.innerHTML = "";
   $("filesEmpty").style.display = files.length ? "none" : "";
+  const cnt = $("fileCount");
+  if (cnt) { cnt.textContent = String(files.length); cnt.hidden = !files.length; }
   for (let i = 0; i < files.length; i++) {
     const f = files[i];
     const li = document.createElement("li");
