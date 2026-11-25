@@ -17,6 +17,7 @@ let MAX_NOTE_MB = 5; // 由 /api/health 下发，仅用于报错提示
 let HEALTH = {}; // /api/health 结果：transfer 配置等，boot 时填充
 let saveTimer = null;
 let renderTimer = null;
+let renderGen = 0; // 渲染代次：异步续签后丢弃过期渲染，防旧内容闪现
 
 /* 单笔记密码：仅存 sessionStorage（标签页关闭即清），随请求头 X-Note-Password 发送 */
 let notePwd = "";
@@ -136,7 +137,6 @@ function applyDock() {
 /* 附件面板：钉住（常驻，可拖宽）/ 临时浮层（点外部收起）/ 收起（右侧窄边条展开入口） */
 function setupAttachPanel() {
   const panel = $("filesPanel");
-  const body = document.querySelector("#editor .editor-body");
   const strip = $("attachStrip");
   $("attachToggle").onclick = () => {
     uiPrefs.attachOpen = !uiPrefs.attachOpen;
@@ -168,14 +168,17 @@ function setupAttachPanel() {
     applyAttach();
     toast(uiPrefs.attachPinned ? "附件面板已钉住，常驻显示" : "附件面板改为临时浮层，点外部自动收起");
   };
-  /* 未钉住的浮层：点面板外（含编辑区/预览）自动收起 */
-  body.addEventListener("click", (e) => {
-    if (uiPrefs.attachOpen && !uiPrefs.attachPinned &&
-        !panel.contains(e.target) && !strip.contains(e.target)) {
-      uiPrefs.attachOpen = false;
-      saveUiPrefs();
-      applyAttach();
-    }
+  /* 未钉住的浮层：点面板外自动收起。监听绑在 document 而非编辑区——
+     顶栏 / 工具栏 / 状态栏 / 首页同样算「外部」。忽略区含「附件」开关自身：
+     冒泡顺序是元素 onclick 先于本监听执行，所以开启状态点开关时它已先收起
+     （本监听见 attachOpen=false 早退），不会出现开→关→开 */
+  document.addEventListener("click", (e) => {
+    if (!uiPrefs.attachOpen || uiPrefs.attachPinned) return;
+    const ignore = [panel, strip, $("attachToggle"), $("pinBtn"), $("showAttachBtn"), $("hideBtn"), $("filesDrop")];
+    if (ignore.some((el) => el && el.contains(e.target))) return;
+    uiPrefs.attachOpen = false;
+    saveUiPrefs();
+    applyAttach();
   });
   /* 空态引导区：点击调起文件选择 */
   $("filesDrop").onclick = () => $("fileInput").click();
@@ -277,10 +280,16 @@ const PURIFY_CFG = {
 };
 
 async function render() {
-  const src = $("content").value;
+  /* 代次先于一切分支递增：早退分支虽然是同步写，但无法作废此前已在途的
+     异步渲染（如切纯文本后，先前的 render 卡在 await ensureNtok 里），
+     不递增就会被在途旧渲染覆盖回 Markdown 视图 */
+  const gen = ++renderGen;
+  const ta = $("content");
+  let src = ta.value;
   const preview = $("preview");
   /* 纯文本模式，或 Markdown 库还没下载完：按原文显示
-     （textContent 天然转义，无 XSS 风险；库就绪后由 DOMContentLoaded 补渲染） */
+     （同步早退，不经过 await；textContent 天然转义，无 XSS 风险；
+     库就绪后由 DOMContentLoaded 补渲染） */
   if (plainMode || !ensureMdLibs()) {
     const pre = document.createElement("pre");
     pre.className = "plaintext";
@@ -292,6 +301,10 @@ async function render() {
   }
   /* 受保护笔记：令牌临近过期时自动续签，避免长编辑会话（>15 分钟）附件全 401 */
   await ensureNtok();
+  /* 续签期间 textarea 有新输入或更新了更新的渲染 → 丢弃本次结果，
+     防在途旧渲染把过期内容写回预览（新触发由调用方/防抖负责） */
+  if (gen !== renderGen || ta.value !== src) return;
+  src = ta.value; // 同代次下的极小窗口也取最新值
   const html = marked.parse(src, { gfm: true, breaks: true });
   preview.innerHTML = DOMPurify.sanitize(html, PURIFY_CFG);
   rewriteAttachUrls(preview);
