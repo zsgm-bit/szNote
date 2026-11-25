@@ -441,10 +441,12 @@ func validSlug(slug string) bool {
 // Plain: true 表示纯文本模式（前端不解析 Markdown，适合贴日志/命令）
 // PwdHash: 非空 = 该笔记受单笔记密码保护（"pbkdf2$iter$salt_hex$hash_hex"，同站点密码格式；
 // 正文以 AES-256-CBC 密文 blob 落盘，字段可缺省，旧 meta 文件完全兼容）
+// Rev: 正文版本号（软锁用），每次成功写入正文 +1；旧 meta 缺省从 0 起，首次写入后即为 1
 type noteMeta struct {
 	TTLHours int    `json:"ttl_hours"`
 	Plain    bool   `json:"plain,omitempty"`
 	PwdHash  string `json:"pwd_hash,omitempty"`
+	Rev      uint64 `json:"rev,omitempty"`
 }
 
 func loadMeta(slug string) (noteMeta, bool) {
@@ -594,6 +596,7 @@ func getNote(w http.ResponseWriter, r *http.Request) {
 		touch(slug)
 	}
 	ttlHours := int(ttlFor(slug).Hours())
+	m, _ := loadMeta(slug)
 	resp := map[string]any{
 		"slug":      slug,
 		"exists":    exists,
@@ -602,9 +605,9 @@ func getNote(w http.ResponseWriter, r *http.Request) {
 		"ttl_hours": ttlHours,
 		"plain":     plainFor(slug),
 		"pwd":       protected,
+		"rev":       m.Rev, // 软锁版本号：客户端保存时回传，不匹配则 409
 	}
 	if protected {
-		m, _ := loadMeta(slug)
 		resp["ntok"] = noteAttachToken(slug, m.PwdHash) // 给预览 <img>/文件列表下载链接用
 	}
 	writeJSON(w, http.StatusOK, resp)
@@ -613,6 +616,11 @@ func getNote(w http.ResponseWriter, r *http.Request) {
 // PUT /api/{slug} —— 保存笔记正文 {"content": "...", "ttl_hours": 24, "plain": false}
 // ttl_hours: 只能是 24/72/120/168；缺省 = 不修改（新笔记用全局默认）
 // plain: 缺省 = 不修改
+// rev（软锁）: 客户端把 GET 时拿到的版本号回传。与当前版本一致 → 正常保存；
+// 不一致 → 409 并返回服务端当前 rev（正文不会被改动）；
+// 缺省 = 旧客户端/CLI 的强制写入语义，正文保留到历史后覆盖。
+// rev + force:true = 用户在 409 冲突弹窗里选择「以我的版本覆盖」，
+// 服务端把被覆盖的旧正文快照进历史（覆盖但可找回），再执行写入。
 func saveNote(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	if !validSlug(slug) {
@@ -631,6 +639,8 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 		Content  string `json:"content"`
 		TTLHours *int   `json:"ttl_hours"`
 		Plain    *bool  `json:"plain"`
+		Rev      *uint64 `json:"rev"`
+		Force    bool    `json:"force"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		// 区分超限（413）与格式错误（400）：统一报 413 会误导用户以为是正文超限
@@ -656,6 +666,21 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 	}
 	writeMu.Lock()
 	defer writeMu.Unlock()
+	// 软锁版本校验（锁内判定，避免与并发写入竞态）
+	var force bool // 本次写入是否需要先快照旧正文
+	if body.Rev != nil {
+		cur, _ := loadMeta(slug)
+		if *body.Rev != cur.Rev {
+			// 版本冲突：无论是否 force 都拒绝，让客户端拿最新 rev 重试
+			writeJSON(w, http.StatusConflict, map[string]any{
+				"ok": false, "error": "笔记已被其他人修改（版本冲突）", "rev": cur.Rev,
+			})
+			return
+		}
+		force = body.Force // rev 匹配 + force = 冲突解决的「以我的版本覆盖」
+	} else {
+		force = true // 旧客户端 / CLI：不带 rev = 强制覆盖语义，旧正文入历史
+	}
 	content := []byte(body.Content)
 	// 锁内无条件重查保护状态与密码有效性（prepareBodyForWrite 内部重读 meta，评审 P2-3）
 	enc, eerr := prepareBodyForWrite(slug, password, content)
@@ -668,16 +693,21 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	if force {
+		snapshotHistory(slug, password, content) // 覆盖前把旧正文存入历史（best-effort，失败不阻断保存）
+	}
 	content = enc
 	if err := persistNote(slug, content, body.TTLHours, body.Plain); err != nil {
 		fail(w, http.StatusInternalServerError, "写入失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	m, _ := loadMeta(slug)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rev": m.Rev})
 }
 
-// persistNote 原子写入正文并按需更新 meta（调用方需已持有 writeMu）。
-// ttlHours/plain 任一非 nil 即合并写入 meta，避免覆盖另一项设置。
+// persistNote 原子写入正文并合并更新 meta（调用方需已持有 writeMu）。
+// ttlHours/plain 非 nil 即合并写入，避免覆盖另一项设置；无论是否携带，
+// 每次成功写入正文都 Rev+1 并落盘 meta——软锁版本号只认「正文变更」这一件事。
 func persistNote(slug string, content []byte, ttlHours *int, plain *bool) error {
 	c := cfg()
 	dir := noteDir(slug)
@@ -691,22 +721,21 @@ func persistNote(slug string, content []byte, ttlHours *int, plain *bool) error 
 	if err := os.Rename(tmp, notePath(slug)); err != nil {
 		return err
 	}
-	if ttlHours != nil || plain != nil {
-		m, _ := loadMeta(slug)
-		if ttlHours != nil {
-			m.TTLHours = *ttlHours
-		}
-		if plain != nil {
-			m.Plain = *plain
-		}
-		if m.TTLHours == 0 { // 还没设过有效期：落成全局默认，避免 0 被当成无效值
-			m.TTLHours = int(c.ttl.Hours())
-		}
-		if mb, err := json.Marshal(m); err != nil {
-			log.Printf("note /%s: meta marshal failed (body ok): %v", slug, err)
-		} else if err := os.WriteFile(metaPath(slug), mb, 0o600); err != nil {
-			log.Printf("note /%s: meta update failed (body ok): %v", slug, err)
-		}
+	m, _ := loadMeta(slug)
+	if ttlHours != nil {
+		m.TTLHours = *ttlHours
+	}
+	if plain != nil {
+		m.Plain = *plain
+	}
+	if m.TTLHours == 0 { // 还没设过有效期：落成全局默认，避免 0 被当成无效值
+		m.TTLHours = int(c.ttl.Hours())
+	}
+	m.Rev++
+	if mb, err := json.Marshal(m); err != nil {
+		log.Printf("note /%s: meta marshal failed (body ok): %v", slug, err)
+	} else if err := os.WriteFile(metaPath(slug), mb, 0o600); err != nil {
+		log.Printf("note /%s: meta update failed (body ok): %v", slug, err)
 	}
 	return nil
 }
@@ -822,12 +851,14 @@ func saveNoteRaw(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	snapshotHistory(slug, password, content) // raw 写入 = 强制覆盖语义（CLI/管道），旧正文入历史（best-effort）
 	content = enc
 	if err := persistNote(slug, content, ttlHours, plain); err != nil {
 		fail(w, http.StatusInternalServerError, "写入失败")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "slug": slug, "bytes": len(content)})
+	m, _ := loadMeta(slug)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "slug": slug, "bytes": len(content), "rev": m.Rev})
 }
 
 // blockedExts 禁止上传的主动内容格式（会在浏览器中执行脚本 / 可托管钓鱼页）
@@ -1785,6 +1816,7 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		clearLoginFails(ip)
+		reencryptHistory(slug, body.Current, true, body.Password) // 历史快照随新密码重加密（best-effort）
 		log.Printf("note /%s: password set (body %d bytes)", slug, len(plain))
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pwd": true})
 		return
@@ -1826,8 +1858,243 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clearLoginFails(ip)
+	reencryptHistory(slug, body.Current, false, "") // 历史快照随解除保护还原明文（best-effort）
 	log.Printf("note /%s: password removed", slug)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pwd": false})
+}
+
+// ---------- 正文历史快照（软锁的「覆盖但可找回」兜底） ----------
+//
+// 强制覆盖（CLI/raw 写入、冲突弹窗里选「以我的版本覆盖」）前，把被覆盖的旧正文
+// 原样复制进 history/ 子目录并登记 index.json；快照 blob 与正文同格式
+// （受保护笔记 = 密文 blob，明文笔记 = 明文），密码变更时随正文一起重加密。
+
+const (
+	histDirName = "history" // 每条笔记目录下的历史子目录（随笔记过期一并删除）
+	histMax     = 10        // 保留的最新快照数，超出按时间从旧到新淘汰
+)
+
+type histItem struct {
+	Rev  uint64 `json:"rev"`  // 被覆盖时该正文的版本号
+	TS   int64  `json:"ts"`   // 快照时间（Unix 秒）
+	Size int    `json:"size"` // 落盘字节数（受保护笔记为密文大小，略大于明文）
+	Enc  bool   `json:"enc"`  // true = blob 已按笔记密码加密（始终等于笔记当前保护状态）
+	File string `json:"file"` // 历史子目录内的 blob 文件名
+}
+
+type histIndex struct {
+	Items []histItem `json:"items"` // 按时间升序
+}
+
+func histDirPath(slug string) string        { return filepath.Join(noteDir(slug), histDirName) }
+func histBlobPath(slug, name string) string { return filepath.Join(histDirPath(slug), name) }
+
+func loadHistIndex(slug string) histIndex {
+	var idx histIndex
+	if b, err := os.ReadFile(filepath.Join(histDirPath(slug), "index.json")); err == nil {
+		_ = json.Unmarshal(b, &idx)
+	}
+	return idx
+}
+
+// saveHistIndex 原子写历史索引（tmp + rename，权限 600）
+func saveHistIndex(slug string, idx histIndex) error {
+	if err := os.MkdirAll(histDirPath(slug), 0o700); err != nil {
+		return err
+	}
+	b, err := json.Marshal(idx)
+	if err != nil {
+		return err
+	}
+	tmp := filepath.Join(histDirPath(slug), "index.json.tmp")
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Join(histDirPath(slug), "index.json"))
+}
+
+// snapshotHistory 把即将被覆盖的当前正文复制进历史（best-effort：
+// 失败只记日志，绝不阻断保存）。旧正文与本次写入内容相同（CLI 反复管道
+// 同一文件）时跳过——覆盖不丢失任何东西就不必留档。
+// password 为当前笔记密码（未保护笔记为 ""），incoming 为本次写入的明文。
+// 调用方需持有 writeMu。
+func snapshotHistory(slug, password string, incoming []byte) {
+	b, err := os.ReadFile(notePath(slug))
+	if err != nil {
+		return // 新笔记首次保存：没有旧正文可快照
+	}
+	m, _ := loadMeta(slug)
+	oldPlain := b
+	if m.PwdHash != "" {
+		if pt, derr := decryptBody(password, b); derr != nil {
+			// 旧正文解不开（理论不会发生）：仍原样留档，宁可多存不可丢失
+			log.Printf("note /%s: history snapshot decrypt old body failed: %v", slug, derr)
+		} else {
+			oldPlain = pt
+		}
+	}
+	if bytes.Equal(oldPlain, incoming) {
+		return // 内容没变：覆盖零丢失，不刷历史
+	}
+	idx := loadHistIndex(slug)
+	rev := m.Rev
+	if rev == 0 {
+		rev = 1 // 升级前遗留的正文：meta 还没有 rev，按 1 记
+	}
+	if err := os.MkdirAll(histDirPath(slug), 0o700); err != nil {
+		log.Printf("note /%s: history mkdir failed: %v", slug, err)
+		return
+	}
+	name := fmt.Sprintf("v%d_%d.bin", rev, time.Now().UnixNano())
+	if err := os.WriteFile(histBlobPath(slug, name), b, 0o600); err != nil {
+		log.Printf("note /%s: history snapshot write failed: %v", slug, err)
+		return
+	}
+	idx.Items = append(idx.Items, histItem{
+		Rev: rev, TS: time.Now().Unix(), Size: len(b), Enc: m.PwdHash != "", File: name,
+	})
+	pruneHistory(slug, &idx)
+	if err := saveHistIndex(slug, idx); err != nil {
+		log.Printf("note /%s: history index write failed: %v", slug, err)
+	}
+}
+
+// pruneHistory 快照数超上限时从最旧的开始淘汰（连同 blob 文件一起删）
+func pruneHistory(slug string, idx *histIndex) {
+	if len(idx.Items) <= histMax {
+		return
+	}
+	for i := 0; i < len(idx.Items)-histMax; i++ {
+		_ = os.Remove(histBlobPath(slug, idx.Items[i].File))
+	}
+	idx.Items = idx.Items[len(idx.Items)-histMax:]
+}
+
+// reencryptHistory 密码变更后同步处理历史快照：改为受保护 → 全部用新密码加密；
+// 解除保护 → 全部还原明文。best-effort：个别快照解密失败只记日志（该条将无法
+// 读取，但不影响正文）。调用方需持有 writeMu 且正文/meta 已按新状态提交成功。
+// oldPwd 为变更前密码（此前未设密码时不会被用到）；newProtected = 变更后是否受保护。
+func reencryptHistory(slug, oldPwd string, newProtected bool, newPwd string) {
+	idx := loadHistIndex(slug)
+	if len(idx.Items) == 0 {
+		return
+	}
+	changed := false
+	for i := range idx.Items {
+		it := &idx.Items[i]
+		if !newProtected && !it.Enc {
+			continue // 明文 → 明文：无事可做
+		}
+		// 注意：it.Enc 只标记保护状态，不标记密码版本——改密后（状态不变）
+		// 旧快照仍是用旧密码加密的，必须解密重加密
+		blob, err := os.ReadFile(histBlobPath(slug, it.File))
+		if err != nil {
+			continue
+		}
+		var plain []byte
+		if it.Enc {
+			if plain, err = decryptBody(oldPwd, blob); err != nil {
+				log.Printf("note /%s: history v%d decrypt failed (skipped): %v", slug, it.Rev, err)
+				continue
+			}
+		} else {
+			plain = blob
+		}
+		var out []byte
+		if newProtected {
+			if out, err = encryptBody(newPwd, plain); err != nil {
+				log.Printf("note /%s: history v%d encrypt failed (skipped): %v", slug, it.Rev, err)
+				continue
+			}
+		} else {
+			out = plain
+		}
+		tmp := histBlobPath(slug, it.File) + ".tmp"
+		if err := os.WriteFile(tmp, out, 0o600); err != nil {
+			log.Printf("note /%s: history v%d rewrite failed: %v", slug, it.Rev, err)
+			continue
+		}
+		if err := os.Rename(tmp, histBlobPath(slug, it.File)); err != nil {
+			log.Printf("note /%s: history v%d rename failed: %v", slug, it.Rev, err)
+			continue
+		}
+		it.Enc = newProtected
+		changed = true
+	}
+	if changed {
+		if err := saveHistIndex(slug, idx); err != nil {
+			log.Printf("note /%s: history index rewrite failed: %v", slug, err)
+		}
+	}
+}
+
+// GET /api/{slug}/history —— 列出历史快照（新→旧）：
+//
+//	curl http://host:8080/api/mynote/history
+//
+// 返回 {"ok":true,"items":[{"rev":3,"ts":1764000000,"size":1234},...]}
+func noteHistory(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	if !validSlug(slug) {
+		fail(w, http.StatusNotFound, "无效的笔记地址")
+		return
+	}
+	if _, _, ok := noteAuth(w, r, slug); !ok {
+		return
+	}
+	idx := loadHistIndex(slug)
+	items := make([]map[string]any, 0, len(idx.Items))
+	for i := len(idx.Items) - 1; i >= 0; i-- {
+		it := idx.Items[i]
+		items = append(items, map[string]any{"rev": it.Rev, "ts": it.TS, "size": it.Size})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "items": items})
+}
+
+// GET /api/{slug}/history/{rev} —— 读取某条历史快照的明文内容（受保护笔记需带密码头）
+func noteHistoryGet(w http.ResponseWriter, r *http.Request) {
+	slug := r.PathValue("slug")
+	if !validSlug(slug) {
+		fail(w, http.StatusNotFound, "无效的笔记地址")
+		return
+	}
+	password, _, ok := noteAuth(w, r, slug)
+	if !ok {
+		return
+	}
+	rev, err := strconv.ParseUint(r.PathValue("rev"), 10, 64)
+	if err != nil {
+		fail(w, http.StatusBadRequest, "历史版本号无效")
+		return
+	}
+	idx := loadHistIndex(slug)
+	var hit *histItem
+	for i := len(idx.Items) - 1; i >= 0; i-- { // 同 rev 取最新一条
+		if idx.Items[i].Rev == rev {
+			hit = &idx.Items[i]
+			break
+		}
+	}
+	if hit == nil {
+		fail(w, http.StatusNotFound, "没有该版本的历史快照")
+		return
+	}
+	blob, err := os.ReadFile(histBlobPath(slug, hit.File))
+	if err != nil {
+		fail(w, http.StatusInternalServerError, "历史快照读取失败")
+		return
+	}
+	content := blob
+	if hit.Enc {
+		pt, derr := decryptBody(password, blob)
+		if derr != nil {
+			log.Printf("note /%s: history v%d decrypt failed: %v", slug, rev, derr)
+			fail(w, http.StatusInternalServerError, "历史快照解密失败（密码可能在该快照产生后变更过）")
+			return
+		}
+		content = pt
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rev": hit.Rev, "ts": hit.TS, "content": string(content)})
 }
 
 // GET /api/{slug}/ntok —— 签发附件短时令牌（受保护笔记解锁后供 <img>/下载链接使用）
@@ -3000,6 +3267,8 @@ func main() {
 	mux.HandleFunc("POST /api/{slug}/password", requireAuth(setNotePassword))
 	mux.HandleFunc("GET /api/{slug}/export", requireAuth(exportZip))
 	mux.HandleFunc("GET /api/{slug}/ntok", requireAuth(noteToken))
+	mux.HandleFunc("GET /api/{slug}/history", requireAuth(noteHistory))
+	mux.HandleFunc("GET /api/{slug}/history/{rev}", requireAuth(noteHistoryGet))
 	mux.HandleFunc("DELETE /api/{slug}/file/{name}", requireAuth(delFile))
 	mux.HandleFunc("POST /api/transfer/init", requireAuth(trInit))
 	mux.HandleFunc("GET /api/transfer", requireAuth(trList))

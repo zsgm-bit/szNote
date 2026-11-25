@@ -24,6 +24,7 @@
 - **正文上限 5MB**：长日志、长输出可直接整段贴进正文（超过返回 413 并提示具体上限），更大内容走附件
 - **有效期 1 / 3 / 5 / 7 天**：按笔记选择，以最后一次查看 / 保存 / 上传为记账起点，到期整文件夹删除（服务端白名单校验）
 - **整包导出 zip**：正文 + 全部附件一键打包
+- **多人并发软锁**：保存携带 `rev` 版本号（乐观锁），笔记被他人修改后保存返回 409，前端弹冲突窗口让用户显式选择「以我的版本覆盖 / 加载服务器版本」，杜绝静默覆盖；被强制覆盖的旧正文自动快照进 `history/`（保留最近 10 份，受保护笔记同样加密且随改密重加密），可通过 history 接口找回
 - **附件管理**：缩略图、悬停看完整文件名、一键下载、同名文件自动加序号（单附件默认 10MB）
 - **文件互传**：顶栏「互传」打开面板，点选或把文件拖入即上传，完成后直接出现在文件列表（每 5 秒自动刷新），对方可下载或撤回；服务器纯中转（不解包、不运行内容），分块上传 + 断点续传，全局上行 / 下行限速独立可配，进度条 + 实时速度；默认仅 `.zip`（白名单可配）、单文件 50MB、完成后保留 24 小时自动清理
 - **下载限速**：默认每连接 100 KB/s，兼容 Range 断点续传；另有每 IP 全局请求限速防扫描
@@ -168,13 +169,14 @@ Docker 部署时该文件以只读方式挂载进容器（`./config.json:/app/co
 ```
 data/notes/<地址>/
 ├── note.md     # 正文（修改时间 = 最后使用时间）
-├── meta.json   # 元数据：{"ttl_hours": 24, "plain": true}
-└── files/      # 附件
-    ├── pic.png
-    └── doc.pdf
+├── meta.json   # 元数据：{"ttl_hours": 24, "plain": true, "rev": 3}
+├── files/      # 附件
+│   ├── pic.png
+│   └── doc.pdf
+└── history/    # 被强制覆盖时的正文快照（index.json + <rev>_<ts>.bin，最多 10 份）
 ```
 
-`plain` 为该笔记是否处于纯文本模式（缺省 = Markdown）。
+`plain` 为该笔记是否处于纯文本模式（缺省 = Markdown）；`rev` 为正文版本号（软锁用，每次成功写入 +1）。
 
 ## HTTP API
 
@@ -184,8 +186,8 @@ data/notes/<地址>/
 | POST | `/api/login` | 登录，body `{"password":"..."}` |
 | POST | `/api/logout` | 退出登录 |
 | GET | `/api/session` | 会话探测（需登录；只读校验，不刷新空闲计时，供前端轮询弹回登录页） |
-| GET | `/api/{slug}` | 读取笔记 `{slug, exists, content, files[], ttl_hours, plain, pwd}`；受保护笔记要求请求头 `X-Note-Password`，未提供 / 错误返回 401 `{protected:true}` |
-| PUT | `/api/{slug}` | 保存，body `{"content":"...","ttl_hours":24,"plain":false}`；受保护笔记同样要求 `X-Note-Password` |
+| GET | `/api/{slug}` | 读取笔记 `{slug, exists, content, files[], ttl_hours, plain, pwd, rev}`；受保护笔记要求请求头 `X-Note-Password`，未提供 / 错误返回 401 `{protected:true}` |
+| PUT | `/api/{slug}` | 保存，body `{"content":"...","ttl_hours":24,"plain":false,"rev":3,"force":false}`；带 `rev` 且与当前不符 → `409 {"rev":当前版本}`（软锁，正文不会被改动）；带 `rev`+`force:true` 或不带 `rev` = 强制覆盖，旧正文自动存入历史；成功返回 `{"ok":true,"rev":新版本}`；受保护笔记同样要求 `X-Note-Password` |
 | GET | `/api/{slug}/raw` | 纯文本读正文（curl 友好；不存在返回 404；响应头带 `X-Note-Ttl-Hours`/`X-Note-Plain`） |
 | PUT / POST | `/api/{slug}/raw` | 纯文本写正文：请求体即原文，可选 `?ttl=24\|72\|120\|168&plain=true\|false` |
 | PUT | `/{slug}` | 上条纯文本写的路径别名（`curl -T 1.txt http://host:8080/mynote`） |
@@ -194,6 +196,8 @@ data/notes/<地址>/
 | DELETE | `/api/{slug}/file/{name}` | 删除附件 |
 | GET | `/api/{slug}/ntok` | 签发附件短时令牌（15 分钟有效，受保护笔记的 `<img>` / 下载链接用 `?ntok=` 携带） |
 | GET | `/api/{slug}/export` | 整包导出 zip |
+| GET | `/api/{slug}/history` | 列出被强制覆盖时保留的历史快照（新→旧，最多 10 份）：`{"items":[{"rev":3,"ts":...,"size":...}]}` |
+| GET | `/api/{slug}/history/{rev}` | 读取某条历史快照的明文内容（受保护笔记需 `X-Note-Password`） |
 | GET | `/f/{slug}/{name}` | 附件访问（图片 / PDF / 文本内嵌，其余下载）；受保护笔记需 `X-Note-Password` 头或 `?ntok=` 令牌 |
 | POST | `/api/transfer/init` | 创建/续接发送会话，body `{"name","size","token"}`，返回 `{code, chunk, offset}` |
 | PUT | `/api/transfer/{code}/chunk?offset=N` | 追加一块数据（服务端限速读取；offset 与服务端不一致时返回 409 + 当前进度） |
@@ -224,6 +228,22 @@ curl -b ck $B/api/mynote/raw
 
 说明：slug 必须是 6~64 位字母数字/连字符/下划线（历史 1~5 位地址仅在笔记已存在时可用）；
 写入可选 `?ttl=168`（7 天）、`?plain=true`（纯文本模式）；正文上限同 `storage.max_note_mb`。
+
+### 多人并发：rev 软锁与历史快照
+
+两个人（或两个标签页）同时编辑同一条笔记时，保存带上 `rev`（GET 时返回的版本号）即可避免静默覆盖：
+
+- 带 `rev` 且与服务端一致 → 正常保存，返回 `{"ok":true,"rev":新版本}`
+- 带 `rev` 但已过期 → `409 {"error":"笔记已被其他人修改（版本冲突）","rev":当前版本}`，正文不被改动；前端会弹出冲突窗口，可选择「以我的版本覆盖」或「加载服务器版本」
+- 不带 `rev`（旧客户端 / CLI 脚本）→ 保持原语义直接覆盖，但旧正文会先存入历史
+- `rev` + `force:true` → 冲突弹窗里选「以我的版本覆盖」，旧正文先存入历史再写入
+
+被覆盖的旧正文保存在笔记目录的 `history/` 子目录（与正文同格式：受保护笔记为密文，且随密码变更自动重加密），最多保留 10 份，随笔记过期一并删除。找回方式：
+
+```bash
+curl -b ck $B/api/mynote/history          # 列出可找回的版本（新→旧）
+curl -b ck $B/api/mynote/history/3        # 取回 rev=3 那份的明文内容
+```
 
 ## 开发
 

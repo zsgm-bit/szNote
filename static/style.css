@@ -930,6 +930,20 @@ code, .mono { font-family: var(--font-mono); }
   border-bottom: 1px solid #eef1f6;
 }
 .modal-head h3 { margin: 0; color: #101828; font-size: 17px; letter-spacing: -.02em; font-weight: 700; }
+
+/* 保存冲突弹窗（rev 软锁）：纵向按钮组 */
+#conflictMask .modal { width: min(100%, 460px); padding-bottom: 16px; }
+#conflictMask .modal > .hint { margin: 14px 20px 0; }
+.conflict-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 16px 20px 0;
+}
+.conflict-actions button { min-height: 42px; width: 100%; }
+#conflictClose { width: 32px; min-height: 32px; padding: 0; background: transparent; box-shadow: none; color: #98a2b3; }
+#conflictClose:hover { background: #f5f7fb; box-shadow: none; color: #344054; }
+
 #swapClose { width: 32px; min-height: 32px; padding: 0; background: transparent; box-shadow: none; color: #98a2b3; }
 #swapClose:hover { background: #f5f7fb; box-shadow: none; color: #344054; }
 .swap-tabs {

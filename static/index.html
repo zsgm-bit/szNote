@@ -234,6 +234,23 @@
   </div>
 </div>
 
+<!-- ========== 保存冲突弹窗（rev 软锁：笔记被他人修改后保存时出现） ========== -->
+<div id="conflictMask" class="modal-mask hidden">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="conflictTitle">
+    <div class="modal-head">
+      <h3 id="conflictTitle">保存冲突</h3>
+      <button id="conflictClose" type="button" class="mini" title="关闭" aria-label="关闭保存冲突弹窗"><svg class="icon" aria-hidden="true"><use href="#icon-close"></use></svg></button>
+    </div>
+    <p class="hint muted">这条笔记刚被其他人修改过，你的编辑基于旧版本。可先「复制我的内容留底」，再选择如何处理：</p>
+    <div class="conflict-actions">
+      <button id="btnConflictMine" type="button" class="primary">以我的版本覆盖（服务器旧版存入历史）</button>
+      <button id="btnConflictTheirs" type="button" class="ghost">放弃我的修改，加载服务器版本</button>
+      <button id="btnConflictCopy" type="button" class="ghost">复制我的内容留底</button>
+    </div>
+    <p class="hint muted">历史保留最近 10 个被覆盖的版本，可通过 <code>GET /api/&lt;地址&gt;/history</code> 找回。</p>
+  </div>
+</div>
+
 <div id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
 
 <!--EDITOR_SCRIPTS_START-->

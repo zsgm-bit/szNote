@@ -25,6 +25,13 @@ try { notePwd = sessionStorage.getItem("sznote_pwd_" + slug) || ""; } catch { /*
 let noteHasPwd = false;
 const pwdHeader = () => notePwd ? { "X-Note-Password": notePwd } : {};
 
+/* 软锁版本号（rev）：GET 时从服务端取，保存时回传；不匹配则服务端 409。
+   null = 尚未拿到（首次加载前），此时保存走无 rev 的强制覆盖语义（旧客户端兼容）。
+   冲突弹窗打开期间暂停自动保存，等用户选择「覆盖 / 放弃」后再恢复。 */
+let noteRev = null;
+let conflictOpen = false;
+let conflictServerRev = null;
+
 /* 附件短时令牌：受保护笔记的 <img>/下载链接无法带自定义请求头，
    解锁后由 getNote / /api/{slug}/ntok 签发 HMAC 令牌（15 分钟有效），访问 /f/ 附件时附带 */
 let noteNtok = "";
@@ -575,6 +582,7 @@ function setupEditor() {
 
   setupToolbar();
   setupPwdModal();
+  setupConflictModal();
   setupDock();
   setupAttachPanel();
   $("mdToolbar").classList.toggle("hidden", plainMode);
@@ -809,6 +817,7 @@ async function load() {
   }
   try {
     const d = await r.json();
+    noteRev = typeof d.rev === "number" ? d.rev : null; // 软锁版本号
     if (d.exists) $("content").value = d.content;
     if ($("content").__gutter) $("content").__gutter();   // 行号列随内容重排
     setPlain(!!d.plain, false);
@@ -832,13 +841,16 @@ function applyTTL(hours) {
   $("ttlSelect").value = String(hours);
 }
 
-async function save() {
+async function save(force = false) {
   clearTimeout(saveTimer);
+  if (conflictOpen) return; // 冲突未解决前不再发起自动保存
   try {
     // ttl_hours 只在有合法值时携带（缺省 = 不修改，服务端把 0 当 400 拒掉）
     const ttl = parseInt($("ttlSelect").value, 10);
     const payload = { content: $("content").value, plain: plainMode };
     if (TTL_DAYS.includes(ttl)) payload.ttl_hours = ttl;
+    if (noteRev != null) payload.rev = noteRev; // 软锁：基于的版本号回传
+    if (force) payload.force = true;            // 冲突解决「以我的版本覆盖」，服务端把旧版存入历史
     const r = await fetch("/api/" + encodeURIComponent(slug), {
       method: "PUT",
       headers: { "Content-Type": "application/json", ...pwdHeader() },
@@ -850,10 +862,17 @@ async function save() {
       showLoginScreen("登录已超时，请重新登录");
       return;
     }
+    if (r.status === 409) { // 版本冲突：笔记已被其他人修改，弹窗让用户选择
+      const d = await r.json().catch(() => ({}));
+      openConflictModal(typeof d.rev === "number" ? d.rev : null);
+      return;
+    }
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
       throw new Error(d.error || "http " + r.status);
     }
+    const d = await r.json();
+    if (typeof d.rev === "number") noteRev = d.rev; // 保存成功即刷新版本号
     dirty = false;
     setStatus("已保存 " + new Date().toLocaleTimeString());
     refreshFiles();
@@ -862,6 +881,59 @@ async function save() {
     const msg = err.message || "未知错误";
     toast("保存失败：" + msg + (/上限|大小/.test(msg) ? "" : "（单条笔记上限 " + MAX_NOTE_MB + " MB）"));
   }
+}
+
+/* ---------- 保存冲突弹窗（rev 软锁） ---------- */
+
+function openConflictModal(serverRev) {
+  if (conflictOpen) return; // 已在弹窗中：保留用户正在做的选择
+  conflictOpen = true;
+  clearTimeout(saveTimer);
+  conflictServerRev = serverRev;
+  $("conflictMask").classList.remove("hidden");
+  setStatus("保存冲突：笔记已被其他人修改");
+}
+
+function closeConflictModal() {
+  conflictOpen = false;
+  $("conflictMask").classList.add("hidden");
+}
+
+function setupConflictModal() {
+  $("conflictClose").onclick = () => {
+    closeConflictModal();
+    setStatus("冲突未处理，内容未保存；处理完可再按 Ctrl+S 重新保存");
+  };
+  $("conflictMask").addEventListener("click", (e) => {
+    if (e.target === $("conflictMask")) $("conflictClose").onclick();
+  });
+  /* 以我的版本覆盖：带上服务端最新 rev + force 重存；服务端先把旧正文快照进历史 */
+  $("btnConflictMine").onclick = async () => {
+    if (conflictServerRev == null) { toast("拿不到服务器版本号，请刷新页面后重试"); return; }
+    noteRev = conflictServerRev;
+    closeConflictModal();
+    await save(true);
+    if (!conflictOpen) toast("已按我的版本覆盖，服务器旧版已存入历史（保留最近 10 个版本）");
+  };
+  /* 放弃本地修改，加载服务器最新版本 */
+  $("btnConflictTheirs").onclick = async () => {
+    try {
+      const r = await fetch("/api/" + encodeURIComponent(slug), { headers: pwdHeader() });
+      if (!r.ok) throw new Error("http " + r.status);
+      const d = await r.json();
+      $("content").value = d.content || "";
+      if ($("content").__gutter) $("content").__gutter();
+      noteRev = typeof d.rev === "number" ? d.rev : null;
+      dirty = false;
+      closeConflictModal();
+      render();
+      setStatus("已加载服务器版本（你的修改已放弃）");
+    } catch {
+      toast("加载服务器版本失败，请重试");
+    }
+  };
+  /* 把本地编辑内容复制到剪贴板留底 */
+  $("btnConflictCopy").onclick = () => copyText($("content").value);
 }
 
 async function exportNote() {
