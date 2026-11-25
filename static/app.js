@@ -209,18 +209,28 @@ function applyAttach() {
 }
 
 async function copyText(text) {
+  // 提示只显示摘要：长笔记整篇塞进 toast 会撑坏提示条
+  const brief = text.length > 120 ? text.slice(0, 120) + "…" : text;
   try {
     await navigator.clipboard.writeText(text);
-    toast("已复制：" + text);
+    toast("已复制：" + brief);
+    return true;
   } catch {
-    // 兼容非 HTTPS 环境
-    const ta = document.createElement("textarea");
-    ta.value = text;
-    document.body.appendChild(ta);
-    ta.select();
-    document.execCommand("copy");
-    ta.remove();
-    toast("已复制：" + text);
+    // 兼容非 HTTPS 环境；失败不再抛出，避免阻断调用方主流程
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      ta.remove();
+      if (!ok) throw new Error("copy rejected");
+      toast("已复制：" + brief);
+      return true;
+    } catch {
+      toast("复制失败，请手动选择内容复制");
+      return false;
+    }
   }
 }
 
@@ -843,7 +853,7 @@ function applyTTL(hours) {
 
 async function save(force = false) {
   clearTimeout(saveTimer);
-  if (conflictOpen) return; // 冲突未解决前不再发起自动保存
+  if (conflictOpen) return false; // 冲突未解决前不再发起自动保存
   try {
     // ttl_hours 只在有合法值时携带（缺省 = 不修改，服务端把 0 当 400 拒掉）
     const ttl = parseInt($("ttlSelect").value, 10);
@@ -858,14 +868,23 @@ async function save(force = false) {
     });
     if (r.status === 401) {
       const d = await r.json().catch(() => ({}));
-      if (d.protected) { openPwdModal("unlock", "笔记密码不正确或已变更，请重新解锁"); return; }
+      if (d.protected) { openPwdModal("unlock", "笔记密码不正确或已变更，请重新解锁"); return false; }
       showLoginScreen("登录已超时，请重新登录");
-      return;
+      return false;
     }
-    if (r.status === 409) { // 版本冲突：笔记已被其他人修改，弹窗让用户选择
+    if (r.status === 409) {
+      // 409 有三种来源：① rev 版本冲突（JSON 带 rev）② 密码在写入前变更
+      // ③ raw 通道文本响应。只有第一种能走冲突弹窗，否则会卡在「拿不到版本号」。
       const d = await r.json().catch(() => ({}));
-      openConflictModal(typeof d.rev === "number" ? d.rev : null);
-      return;
+      if (typeof d.rev === "number") {
+        openConflictModal(d.rev);
+      } else if (d.protected || /密码/.test(d.error || "")) {
+        openPwdModal("unlock", d.error || "笔记密码刚变更，请重新解锁后重试保存");
+      } else {
+        setStatus("保存冲突：" + (d.error || "请刷新后重试"));
+        toast(d.error || "保存冲突，请刷新页面后重试");
+      }
+      return false;
     }
     if (!r.ok) {
       const d = await r.json().catch(() => ({}));
@@ -876,10 +895,12 @@ async function save(force = false) {
     dirty = false;
     setStatus("已保存 " + new Date().toLocaleTimeString());
     refreshFiles();
+    return true;
   } catch (err) {
     setStatus("保存失败！");
     const msg = err.message || "未知错误";
     toast("保存失败：" + msg + (/上限|大小/.test(msg) ? "" : "（单条笔记上限 " + MAX_NOTE_MB + " MB）"));
+    return false;
   }
 }
 
@@ -912,22 +933,29 @@ function setupConflictModal() {
     if (conflictServerRev == null) { toast("拿不到服务器版本号，请刷新页面后重试"); return; }
     noteRev = conflictServerRev;
     closeConflictModal();
-    await save(true);
-    if (!conflictOpen) toast("已按我的版本覆盖，服务器旧版已存入历史（保留最近 10 个版本）");
+    if (await save(true)) toast("已按我的版本覆盖，服务器旧版已存入历史（保留最近 10 个版本）");
   };
   /* 放弃本地修改，加载服务器最新版本 */
   $("btnConflictTheirs").onclick = async () => {
     try {
+      const mine = $("content").value;
+      // 直接替换 textarea 会丢本地内容：先自动留底；复制失败也不阻断加载
+      const copied = mine ? await copyText(mine) : false;
       const r = await fetch("/api/" + encodeURIComponent(slug), { headers: pwdHeader() });
       if (!r.ok) throw new Error("http " + r.status);
       const d = await r.json();
       $("content").value = d.content || "";
       if ($("content").__gutter) $("content").__gutter();
       noteRev = typeof d.rev === "number" ? d.rev : null;
+      // 评审：模式/有效期也要跟服务器一致，否则下次保存会把旧设置写回去
+      setPlain(!!d.plain, false);
+      if (typeof d.ttl_hours === "number") applyTTL(d.ttl_hours);
       dirty = false;
       closeConflictModal();
       render();
-      setStatus("已加载服务器版本（你的修改已放弃）");
+      setStatus(copied
+        ? "已加载服务器版本（你的修改已复制到剪贴板留底）"
+        : "已加载服务器版本（剪贴板不可用，请注意本地修改已放弃）");
     } catch {
       toast("加载服务器版本失败，请重试");
     }
@@ -1094,6 +1122,8 @@ function setupPwdModal() {
       $("pwdOld").value = "";
       updateLockBtn();
       closePwdModal();
+      // 服务端重加密正文时 rev 已递增，不同步会让下一次保存误报 409
+      if (typeof d.rev === "number") noteRev = d.rev;
       await ensureNtok(true); // 服务端已按新密码哈希作废旧令牌，立即换新
       render();
       setStatus("已保存 " + new Date().toLocaleTimeString());

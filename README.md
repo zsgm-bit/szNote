@@ -176,7 +176,9 @@ data/notes/<地址>/
 └── history/    # 被强制覆盖时的正文快照（index.json + <rev>_<ts>.bin，最多 10 份）
 ```
 
-`plain` 为该笔记是否处于纯文本模式（缺省 = Markdown）；`rev` 为正文版本号（软锁用，每次成功写入 +1）。
+`plain` 为该笔记是否处于纯文本模式（缺省 = Markdown）；`rev` 为正文版本号（软锁用，每次成功写入正文或改密 +1）。
+正文与 meta 的双写由 `note.md.rvpend` / `note.md.rvbackup` 事务标记保护：正常路径写完即清理；
+若进程恰好在两次 rename 之间崩溃，启动时自动按标记回滚或确认提交，保证正文与 `rev` 始终配对。
 
 ## HTTP API
 
@@ -192,7 +194,7 @@ data/notes/<地址>/
 | PUT / POST | `/api/{slug}/raw` | 纯文本写正文：请求体即原文，可选 `?ttl=24\|72\|120\|168&plain=true\|false` |
 | PUT | `/{slug}` | 上条纯文本写的路径别名（`curl -T 1.txt http://host:8080/mynote`） |
 | POST | `/api/{slug}/upload` | multipart 上传，字段名 `file` |
-| POST | `/api/{slug}/password` | 单笔记密码：`{"action":"set","password":"..","current":".."}`（已设密码时 `current` 必填）或 `{"action":"remove","current":".."}`；set 后正文加密落盘 |
+| POST | `/api/{slug}/password` | 单笔记密码：`{"action":"set","password":"..","current":".."}`（已设密码时 `current` 必填）或 `{"action":"remove","current":".."}`；set 后正文加密落盘，响应带 `{"ok":true,"pwd":..,"rev":新版本}`（正文重写也会递增 rev） |
 | DELETE | `/api/{slug}/file/{name}` | 删除附件 |
 | GET | `/api/{slug}/ntok` | 签发附件短时令牌（15 分钟有效，受保护笔记的 `<img>` / 下载链接用 `?ntok=` 携带） |
 | GET | `/api/{slug}/export` | 整包导出 zip |
@@ -219,7 +221,7 @@ B=http://127.0.0.1:9720
 cat 1.txt | curl -T - $B/api/mynote/raw    # 管道写入（cat 1.txt > sznote/mynote）
 curl -T 1.txt $B/mynote                    # 文件直传（/api/{slug}/raw 的路径别名）
 curl $B/api/mynote/raw                     # 读取正文
-curl -I $B/api/mynote/raw                  # 只看元信息（X-Note-Ttl-Hours / X-Note-Plain）
+curl -I $B/api/mynote/raw                  # 只看元信息（X-Note-Rev / X-Note-Ttl-Hours / X-Note-Plain）
 # ---- 启用密码时：先登录拿 Cookie ----
 curl -s -c ck -d '{"password":"你的密码"}' $B/api/login
 curl -b ck -T 1.txt $B/api/mynote/raw
@@ -227,18 +229,21 @@ curl -b ck $B/api/mynote/raw
 ```
 
 说明：slug 必须是 6~64 位字母数字/连字符/下划线（历史 1~5 位地址仅在笔记已存在时可用）；
-写入可选 `?ttl=168`（7 天）、`?plain=true`（纯文本模式）；正文上限同 `storage.max_note_mb`。
+写入可选 `?ttl=168`（7 天）、`?plain=true`（纯文本模式）、`?rev=3&force=1`（软锁，见下）；
+正文上限同 `storage.max_note_mb`。
 
 ### 多人并发：rev 软锁与历史快照
 
 两个人（或两个标签页）同时编辑同一条笔记时，保存带上 `rev`（GET 时返回的版本号）即可避免静默覆盖：
 
 - 带 `rev` 且与服务端一致 → 正常保存，返回 `{"ok":true,"rev":新版本}`
-- 带 `rev` 但已过期 → `409 {"error":"笔记已被其他人修改（版本冲突）","rev":当前版本}`，正文不被改动；前端会弹出冲突窗口，可选择「以我的版本覆盖」或「加载服务器版本」
-- 不带 `rev`（旧客户端 / CLI 脚本）→ 保持原语义直接覆盖，但旧正文会先存入历史
+- 带 `rev` 但已过期 → `409 {"error":"笔记已被其他人修改（版本冲突）","rev":当前版本}`，正文不被改动；前端会弹出冲突窗口，可选择「以我的版本覆盖」或「加载服务器版本」（后者会先把你的内容复制到剪贴板留底）
+- 不带 `rev`（旧客户端 / 默认 CLI 语义）→ 保持原语义直接覆盖，但旧正文会先存入历史
 - `rev` + `force:true` → 冲突弹窗里选「以我的版本覆盖」，旧正文先存入历史再写入
+- 脚本软锁：先 `curl -D- -o /dev/null $B/api/mynote/raw` 取 `X-Note-Rev`，写时带
+  `?rev=N`（不符即 409，防管道误覆盖他人编辑），确认后才 `?rev=N&force=1`
 
-被覆盖的旧正文保存在笔记目录的 `history/` 子目录（与正文同格式：受保护笔记为密文，且随密码变更自动重加密），最多保留 10 份，随笔记过期一并删除。找回方式：
+被覆盖的旧正文保存在笔记目录的 `history/` 子目录（与正文同格式：受保护笔记为密文，且随密码变更自动重加密），最多保留 10 份，随笔记过期一并删除；**正文、`history/` 与全部附件**一并计入 `storage.max_note_total_mb` 单笔记配额。找回方式：
 
 ```bash
 curl -b ck $B/api/mynote/history          # 列出可找回的版本（新→旧）

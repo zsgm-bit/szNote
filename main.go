@@ -636,9 +636,9 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 	c := cfg()
 	r.Body = http.MaxBytesReader(w, r.Body, c.maxNote*2+(1<<16))
 	var body struct {
-		Content  string `json:"content"`
-		TTLHours *int   `json:"ttl_hours"`
-		Plain    *bool  `json:"plain"`
+		Content  string  `json:"content"`
+		TTLHours *int    `json:"ttl_hours"`
+		Plain    *bool   `json:"plain"`
 		Rev      *uint64 `json:"rev"`
 		Force    bool    `json:"force"`
 	}
@@ -705,23 +705,98 @@ func saveNote(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "rev": m.Rev})
 }
 
+// revPending 是 persistNote 的双写事务标记：Rev 为写入前的版本号，HadPrev 表示
+// 写入前存在旧正文（旧正文原样备份在 .rvbackup）。进程在「正文已换、meta 未换」
+// 之间崩溃时，启动时由 recoverPendingWrites 据此回滚，保证正文与 rev 始终配对。
+type revPending struct {
+	Rev     uint64 `json:"rev"`
+	HadPrev bool   `json:"had_prev"`
+}
+
+func revPendingPath(slug string) string { return notePath(slug) + ".rvpend" }
+func revBackupPath(slug string) string  { return notePath(slug) + ".rvbackup" }
+
+func clearRevJournal(slug string) {
+	_ = os.Remove(revPendingPath(slug))
+	_ = os.Remove(revBackupPath(slug))
+}
+
+// recoverPendingWrites 启动时对账正文/meta 双写（须在服务接受请求前调用）。
+// 标记中的 rev 是写入前版本：meta.Rev 已 +1 → meta 提交成功，清理标记即可；
+// meta.Rev 未变 → 正文可能已被新内容替换，按备份回滚到写入前状态。
+func recoverPendingWrites() {
+	entries, err := os.ReadDir(notesRoot())
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		slug := e.Name()
+		pj, err := os.ReadFile(revPendingPath(slug))
+		if err != nil {
+			continue
+		}
+		var p revPending
+		if err := json.Unmarshal(pj, &p); err != nil {
+			log.Printf("note /%s: invalid rev journal, discarded: %v", slug, err)
+			clearRevJournal(slug)
+			continue
+		}
+		m, ok := loadMeta(slug)
+		switch {
+		case ok && m.Rev == p.Rev+1:
+			clearRevJournal(slug) // meta 已提交：正文必然也已换，无需回滚
+		case ok && m.Rev == p.Rev:
+			// meta 未提交：正文可能已经换成新内容，恢复写入前的备份
+			if p.HadPrev {
+				b, rerr := os.ReadFile(revBackupPath(slug))
+				if rerr != nil {
+					log.Printf("note /%s: CRITICAL rev rollback backup missing: %v", slug, rerr)
+					clearRevJournal(slug)
+					continue
+				}
+				tmp := notePath(slug) + ".tmp"
+				rerr = writeFileSync(tmp, b)
+				if rerr == nil {
+					rerr = os.Rename(tmp, notePath(slug))
+				}
+				if rerr != nil {
+					log.Printf("note /%s: CRITICAL rev rollback failed: %v", slug, rerr)
+				}
+			} else if rerr := os.Remove(notePath(slug)); rerr != nil && !os.IsNotExist(rerr) {
+				log.Printf("note /%s: CRITICAL rev rollback remove failed: %v", slug, rerr)
+			}
+			clearRevJournal(slug)
+		default:
+			log.Printf("note /%s: rev journal mismatch (meta=%d, journal=%d), discarded", slug, m.Rev, p.Rev)
+			clearRevJournal(slug)
+		}
+	}
+}
+
 // persistNote 原子写入正文并合并更新 meta（调用方需已持有 writeMu）。
 // ttlHours/plain 非 nil 即合并写入，避免覆盖另一项设置；无论是否携带，
 // 每次成功写入正文都 Rev+1 并落盘 meta——软锁版本号只认「正文变更」这一件事。
+// 双写顺序：meta.tmp/正文.tmp/旧正文备份/事务标记（均 fsync）→ 正文 rename
+// → meta rename → 清标记。同步失败立即回滚；进程崩溃由启动对账兜底。
 func persistNote(slug string, content []byte, ttlHours *int, plain *bool) error {
 	c := cfg()
 	dir := noteDir(slug)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	tmp := notePath(slug) + ".tmp"
-	if err := os.WriteFile(tmp, content, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, notePath(slug)); err != nil {
-		return err
+	// 旧正文用于失败/崩溃回滚：目录可能尚未创建（新笔记首次保存），读不到 = 无旧正文
+	var prev []byte
+	hadPrev := true
+	if b, err := os.ReadFile(notePath(slug)); err != nil {
+		hadPrev = false
+	} else {
+		prev = b
 	}
 	m, _ := loadMeta(slug)
+	oldRev := m.Rev
 	if ttlHours != nil {
 		m.TTLHours = *ttlHours
 	}
@@ -732,11 +807,60 @@ func persistNote(slug string, content []byte, ttlHours *int, plain *bool) error 
 		m.TTLHours = int(c.ttl.Hours())
 	}
 	m.Rev++
-	if mb, err := json.Marshal(m); err != nil {
-		log.Printf("note /%s: meta marshal failed (body ok): %v", slug, err)
-	} else if err := os.WriteFile(metaPath(slug), mb, 0o600); err != nil {
-		log.Printf("note /%s: meta update failed (body ok): %v", slug, err)
+	mb, err := json.Marshal(m)
+	if err != nil {
+		return err
 	}
+	metaTmp := metaPath(slug) + ".tmp"
+	if err := writeFileSync(metaTmp, mb); err != nil {
+		return err
+	}
+	tmp := notePath(slug) + ".tmp"
+	if err := writeFileSync(tmp, content); err != nil {
+		_ = os.Remove(metaTmp)
+		return err
+	}
+	if err := writeFileSync(revBackupPath(slug), prev); err != nil {
+		_ = os.Remove(metaTmp)
+		_ = os.Remove(tmp)
+		return err
+	}
+	pj, err := json.Marshal(revPending{Rev: oldRev, HadPrev: hadPrev})
+	if err != nil {
+		_ = os.Remove(metaTmp)
+		_ = os.Remove(tmp)
+		clearRevJournal(slug)
+		return err
+	}
+	if err := writeFileSync(revPendingPath(slug), pj); err != nil {
+		_ = os.Remove(metaTmp)
+		_ = os.Remove(tmp)
+		clearRevJournal(slug)
+		return err
+	}
+	if err := os.Rename(tmp, notePath(slug)); err != nil {
+		_ = os.Remove(metaTmp)
+		clearRevJournal(slug)
+		return err
+	}
+	if err := os.Rename(metaTmp, metaPath(slug)); err != nil {
+		// 同步失败：按备份立即回滚正文，meta 仍是旧版本
+		if hadPrev {
+			werr := writeFileSync(tmp, prev)
+			if werr == nil {
+				werr = os.Rename(tmp, notePath(slug))
+			}
+			if werr != nil {
+				log.Printf("note /%s: CRITICAL persist rollback failed (body new, meta old): %v", slug, werr)
+			}
+		} else if rmErr := os.Remove(notePath(slug)); rmErr != nil {
+			log.Printf("note /%s: CRITICAL persist rollback remove failed: %v", slug, rmErr)
+		}
+		_ = os.Remove(metaTmp)
+		clearRevJournal(slug)
+		return err
+	}
+	clearRevJournal(slug)
 	return nil
 }
 
@@ -784,7 +908,9 @@ func getNoteRaw(w http.ResponseWriter, r *http.Request) {
 		b = pt
 	}
 	touch(slug)
+	m, _ := loadMeta(slug)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Note-Rev", strconv.FormatUint(m.Rev, 10)) // 脚本取版本后可条件写 ?rev=N
 	w.Header().Set("X-Note-Ttl-Hours", strconv.Itoa(int(ttlFor(slug).Hours())))
 	w.Header().Set("X-Note-Plain", strconv.FormatBool(plainFor(slug)))
 	if protected {
@@ -799,9 +925,15 @@ func getNoteRaw(w http.ResponseWriter, r *http.Request) {
 //	cat 1.txt | curl -T - http://host:8080/api/mynote/raw  # 管道写入
 //	echo hi | curl --data-binary @- -X POST http://host:8080/api/mynote/raw
 //	curl -T 1.txt "http://host:8080/mynote?ttl=168"        # 路径别名 + 可选参数
+//	curl -D- -o /dev/null http://host:8080/api/mynote/raw  # 读回 X-Note-Rev 再条件写
+//	curl -T 1.txt "http://host:8080/api/mynote/raw?rev=3"  # 软锁：版本不符返回 409
+//	curl -T 1.txt "http://host:8080/api/mynote/raw?rev=3&force=1"  # 确认覆盖（旧版入历史）
 //
-// 可选查询参数：ttl=24|72|120|168（天×24）、plain=true|false；缺省 = 不修改
-//（新笔记沿用全局默认）。响应为 {"ok":true,"slug":...,"bytes":...}。
+// 可选查询参数：ttl=24|72|120|168（天×24）、plain=true|false、
+// rev=N（软锁，评审：与 JSON 保存同语义，不符返回 409 + X-Note-Rev 头；
+// 配 force=1 表示知晓冲突仍覆盖）、force=1（不带 rev 时无意义，缺省即覆盖）；
+// 正文版本可由 GET raw 的 X-Note-Rev 响应头取得。缺省 = 不修改
+//（新笔记沿用全局默认）。响应为 {"ok":true,"slug":...,"bytes":...,"rev":...}。
 func saveNoteRaw(w http.ResponseWriter, r *http.Request) {
 	slug := r.PathValue("slug")
 	if !validSlug(slug) {
@@ -838,8 +970,41 @@ func saveNoteRaw(w http.ResponseWriter, r *http.Request) {
 		}
 		plain = &b
 	}
+	// rev 软锁（评审：raw/CLI 通道补上，脚本可与浏览器编辑并存而不互冲）：
+	// 带 rev 且不符 → 409（正文不动）；带 rev 且相符 / 带 force=1 → 覆盖并快照旧版；
+	// 都不带 = 强制覆盖语义（旧版快照，向后兼容）
+	var rawRev *uint64
+	rawForce := false
+	if q := r.URL.Query().Get("rev"); q != "" {
+		rev, err := strconv.ParseUint(q, 10, 64)
+		if err != nil {
+			fail(w, http.StatusBadRequest, "rev 参数须为非负整数")
+			return
+		}
+		rawRev = &rev
+	}
+	if q := r.URL.Query().Get("force"); q != "" {
+		b, err := strconv.ParseBool(q)
+		if err != nil {
+			fail(w, http.StatusBadRequest, "force 参数只能是 true 或 false")
+			return
+		}
+		rawForce = b
+	}
 	writeMu.Lock()
 	defer writeMu.Unlock()
+	snapshot := rawRev == nil || rawForce // 强制语义才快照
+	if rawRev != nil {
+		cur, _ := loadMeta(slug)
+		if *rawRev != cur.Rev {
+			if !rawForce {
+				w.Header().Set("X-Note-Rev", strconv.FormatUint(cur.Rev, 10))
+				fail(w, http.StatusConflict,
+					fmt.Sprintf("版本冲突：服务端当前 rev=%d（正文未改动；确认覆盖用 ?rev=%d&force=1）", cur.Rev, cur.Rev))
+				return
+			}
+		}
+	}
 	// 锁内无条件重查保护状态与密码有效性（prepareBodyForWrite 内部重读 meta，评审 P2-3）
 	enc, eerr := prepareBodyForWrite(slug, password, content)
 	if eerr != nil {
@@ -851,14 +1016,35 @@ func saveNoteRaw(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	snapshotHistory(slug, password, content) // raw 写入 = 强制覆盖语义（CLI/管道），旧正文入历史（best-effort）
+	if snapshot {
+		snapshotHistory(slug, password, content) // 强制覆盖语义（CLI/管道或 force=1）：旧正文入历史（best-effort）
+	}
 	content = enc
 	if err := persistNote(slug, content, ttlHours, plain); err != nil {
 		fail(w, http.StatusInternalServerError, "写入失败")
 		return
 	}
 	m, _ := loadMeta(slug)
+	w.Header().Set("X-Note-Rev", strconv.FormatUint(m.Rev, 10))
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "slug": slug, "bytes": len(content), "rev": m.Rev})
+}
+
+// noteTreeSize 笔记目录整棵树的文件总大小（跳过 .tmp 在途文件），失败按已统计部分返回
+func noteTreeSize(dir string) int64 {
+	var sum int64
+	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
+		// .tmp 是在途文件；.rvpend/.rvbackup 是短命事务标记，正常路径已清理，
+		// 残留时启动对账也会清掉，不计入配额
+		if err != nil || d.IsDir() || strings.HasSuffix(p, ".tmp") ||
+			strings.HasSuffix(p, ".rvpend") || strings.HasSuffix(p, ".rvbackup") {
+			return nil
+		}
+		if fi, ierr := d.Info(); ierr == nil {
+			sum += fi.Size()
+		}
+		return nil
+	})
+	return sum
 }
 
 // blockedExts 禁止上传的主动内容格式（会在浏览器中执行脚本 / 可托管钓鱼页）
@@ -930,18 +1116,13 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	writeMu.Lock()
 	defer writeMu.Unlock()
 
-	// 单笔记总大小配额（防存储耗尽）：预检用客户端声明快速拒绝，写完后按实际大小复核
+	// 单笔记总大小配额（防存储耗尽）：预检用客户端声明快速拒绝，写完后按实际大小复核。
+	// 统计整棵笔记目录——正文、全部附件、history/ 快照都计入。
+	// 注意：同名文件不会覆盖（1040 行起自动改名 -1/-2），因此绝不能预扣旧文件体积，
+	// 否则每次重传同名文件都会白得一份额度，配额可被逐步突破。
 	var total int64
 	if c.maxNoteTotal > 0 {
-		if entries, err := os.ReadDir(dir); err == nil {
-			for _, e := range entries {
-				if !e.IsDir() {
-					if info, err := e.Info(); err == nil {
-						total += info.Size()
-					}
-				}
-			}
-		}
+		total = noteTreeSize(noteDir(slug))
 		if total+hdr.Size > c.maxNoteTotal {
 			fail(w, http.StatusRequestEntityTooLarge,
 				fmt.Sprintf("附件总大小超过上限（%d MB）", c.maxNoteTotal>>20))
@@ -976,7 +1157,7 @@ func upload(w http.ResponseWriter, r *http.Request) {
 	}
 	dst.Close()
 	// 配额复核：hdr.Size 是客户端自报的 multipart 声明、可伪造（报小写大），
-	// 以落盘实际大小为准，超限即删除刚写入的文件
+	// 以落盘实际大小为准，超限即删除刚写入的文件。total 为整棵笔记目录的实际占用。
 	if c.maxNoteTotal > 0 {
 		p := filepath.Join(dir, final)
 		if fi, err := os.Stat(p); err == nil && total+fi.Size() > c.maxNoteTotal {
@@ -1714,6 +1895,11 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	writeMu.Lock()
+	defer writeMu.Unlock()
+
+	// 评审：meta 与正文的读取、密码校验全部移入 writeMu 内。此前在锁外读到旧正文，
+	// 并发保存的新正文会被随后用旧明文重写的密码操作静默覆盖；软锁也覆盖不到该路径。
 	m, _ := loadMeta(slug)
 	protected := m.PwdHash != ""
 
@@ -1743,9 +1929,6 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 			plain = b
 		}
 	}
-
-	writeMu.Lock()
-	defer writeMu.Unlock()
 
 	// 事务化写入（评审 P1-2）：先写 meta.tmp（fsync）→ rename 正文 → rename meta；
 	// 任一步失败即中止，meta rename 失败时回滚正文，杜绝
@@ -1784,6 +1967,7 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		m.PwdHash = hash
+		m.Rev++ // 正文被重新加密写入：与 persistNote 一样递增 rev，避免旧客户端绕过软锁
 		if m.TTLHours == 0 { // 与 persistNote 同规则：0 会 ttlFor 被当无效值按 7 天，落成全局默认
 			m.TTLHours = int(cfg().ttl.Hours())
 		}
@@ -1818,7 +2002,7 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 		clearLoginFails(ip)
 		reencryptHistory(slug, body.Current, true, body.Password) // 历史快照随新密码重加密（best-effort）
 		log.Printf("note /%s: password set (body %d bytes)", slug, len(plain))
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pwd": true})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pwd": true, "rev": m.Rev})
 		return
 	}
 
@@ -1828,6 +2012,7 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	m.PwdHash = ""
+	m.Rev++ // 正文被解密还原写入：同样递增 rev
 	if m.TTLHours == 0 {
 		m.TTLHours = int(cfg().ttl.Hours())
 	}
@@ -1860,7 +2045,7 @@ func setNotePassword(w http.ResponseWriter, r *http.Request) {
 	clearLoginFails(ip)
 	reencryptHistory(slug, body.Current, false, "") // 历史快照随解除保护还原明文（best-effort）
 	log.Printf("note /%s: password removed", slug)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pwd": false})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "pwd": false, "rev": m.Rev})
 }
 
 // ---------- 正文历史快照（软锁的「覆盖但可找回」兜底） ----------
@@ -1953,21 +2138,25 @@ func snapshotHistory(slug, password string, incoming []byte) {
 	idx.Items = append(idx.Items, histItem{
 		Rev: rev, TS: time.Now().Unix(), Size: len(b), Enc: m.PwdHash != "", File: name,
 	})
-	pruneHistory(slug, &idx)
+	removed := pruneHistory(&idx)
 	if err := saveHistIndex(slug, idx); err != nil {
 		log.Printf("note /%s: history index write failed: %v", slug, err)
+		return // 索引没更新前不能删 blob，否则会留下指向不存在文件的记录
+	}
+	// 索引提交成功后再删淘汰的 blob：中途失败最多多留几个孤儿文件，索引始终自洽
+	for _, it := range removed {
+		_ = os.Remove(histBlobPath(slug, it.File))
 	}
 }
 
-// pruneHistory 快照数超上限时从最旧的开始淘汰（连同 blob 文件一起删）
-func pruneHistory(slug string, idx *histIndex) {
+// pruneHistory 从索引里裁掉最旧的快照，返回被裁掉的条目（由调用方在索引落盘后删 blob）
+func pruneHistory(idx *histIndex) []histItem {
 	if len(idx.Items) <= histMax {
-		return
+		return nil
 	}
-	for i := 0; i < len(idx.Items)-histMax; i++ {
-		_ = os.Remove(histBlobPath(slug, idx.Items[i].File))
-	}
+	removed := append([]histItem(nil), idx.Items[:len(idx.Items)-histMax]...)
 	idx.Items = idx.Items[len(idx.Items)-histMax:]
+	return removed
 }
 
 // reencryptHistory 密码变更后同步处理历史快照：改为受保护 → 全部用新密码加密；
@@ -3209,6 +3398,7 @@ func main() {
 	if err := os.MkdirAll(notesRoot(), 0o700); err != nil {
 		log.Fatalf("failed to create data dir %s: %v", notesRoot(), err)
 	}
+	recoverPendingWrites() // 正文/meta 双写崩溃对账，必须在接受请求前完成
 	if err := os.MkdirAll(transfersRoot(), 0o700); err != nil {
 		log.Fatalf("failed to create transfers dir %s: %v", transfersRoot(), err)
 	}
